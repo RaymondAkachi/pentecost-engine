@@ -1,0 +1,23 @@
+# services/ingestion/Dockerfile.test
+FROM golang:1.26-alpine
+
+# 1. Install Runtime Dependencies
+RUN apk update && apk add --no-cache \
+    ffmpeg \
+    build-base
+
+WORKDIR /app
+
+# 2. Cache Go Modules
+COPY go.mod go.sum ./
+RUN go mod download
+
+# 3. Copy Source Code
+COPY . .
+
+# 4. PRE-COMPILE the Go Binary (Crucial for performance)
+# This prevents the "compile time" from eating into your "test timeout"
+RUN go build -o /app/ingestion-bin .
+
+# 5. Default Command (can be overridden by docker-compose)
+CMD ["/app/ingestion-bin"]

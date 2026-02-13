@@ -1,0 +1,33 @@
+# infra/monitoring/prometheus.yml
+global:
+  scrape_interval: 1s  # High frequency for real-time monitoring
+
+scrape_configs:
+  - job_name: 'ingestion'
+    static_configs:
+      - targets: ['ingestion:8080']
+    metrics_path: /metrics
+    
+  - job_name: 'denoiser'
+    static_configs:
+      - targets: ['denoiser:8080']
+      
+  - job_name: 'asr'
+    static_configs:
+      - targets: ['asr:8080']
+      
+  - job_name: 'tts'
+    static_configs:
+      - targets: ['tts:8080']
+      
+  - job_name: 'vsync'
+    static_configs:
+      - targets: ['vsync:8080']
+      
+  - job_name: 'orchestrator'
+    static_configs:
+      - targets: ['host.docker.internal:8080']
+
+  - job_name: 'nats'
+    static_configs:
+      - targets: ['nats-1:7777']

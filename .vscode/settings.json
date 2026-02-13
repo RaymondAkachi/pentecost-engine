@@ -1,0 +1,8 @@
+{
+    "python.analysis.extraPaths": [
+        "./shared",
+        "./services/asr",
+        "./services/denoiser"
+    ],
+    "python.terminal.activateEnvInCurrentTerminal": true
+}

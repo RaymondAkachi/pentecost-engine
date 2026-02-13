@@ -1,0 +1,20 @@
+[project]
+name = "shared"
+version = "0.1.0"
+description = "Shared logic for Pentecost Engine (NATS, Metrics, Protobufs)"
+dependencies = [
+    "nats-py>=2.9.0",
+    "protobuf>=5.29.3",  # Upgrade this line
+    "prometheus-client>=0.20.0",
+]
+
+[build-system]
+# Switching to setuptools for better flat-layout support in polyglot folders
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# Explicitly tell it to look in the current directory for the package
+packages = ["shared"]
+package-dir = {"shared"= "."}
+

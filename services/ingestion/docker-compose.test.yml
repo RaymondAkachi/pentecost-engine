@@ -1,0 +1,29 @@
+# docker-compose.test.yml
+version: '3.8'
+
+services:
+  nats:
+    # Use 'alpine' tag to ensure 'wget' is available for the healthcheck
+    image: nats:alpine
+    # ADDED '-m 8222': This turns on the HTTP monitoring port
+    command: "-js -m 8222"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      # Now this URL will actually exist
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  ingestion-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    environment:
+      - NATS_URL=nats://nats:4222
+      - INPUT_URL=test_fixture.mp4
+    depends_on:
+      nats:
+        condition: service_healthy

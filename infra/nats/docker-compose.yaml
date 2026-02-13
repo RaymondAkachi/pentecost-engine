@@ -1,0 +1,49 @@
+# infra/nats/docker-compose.yml
+version: '3.8'
+
+services:
+  nats-1:
+    image: nats:2.10-alpine
+    command: >
+      --server_name nats-1
+      --jetstream
+      --store_dir /data/jetstream
+      --cluster_name pentecost
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-2:6222,nats://nats-3:6222
+      --http_port 8222
+      --port 4222
+    volumes:
+      - nats-1-data:/data/jetstream
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+
+  nats-2:
+    image: nats:2.10-alpine
+    command: >
+      --server_name nats-2
+      --jetstream
+      --store_dir /data/jetstream
+      --cluster_name pentecost
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-1:6222,nats://nats-3:6222
+    volumes:
+      - nats-2-data:/data/jetstream
+
+  nats-3:
+    image: nats:2.10-alpine
+    command: >
+      --server_name nats-3
+      --jetstream
+      --store_dir /data/jetstream
+      --cluster_name pentecost
+      --cluster nats://0.0.0.0:6222
+      --routes nats://nats-1:6222,nats://nats-2:6222
+    volumes:
+      - nats-3-data:/data/jetstream
+
+volumes:
+  nats-1-data:
+  nats-2-data:
+  nats-3-data:

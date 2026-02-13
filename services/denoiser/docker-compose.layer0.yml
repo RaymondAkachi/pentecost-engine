@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  # 1. Message Broker
+  nats:
+    image: nats:alpine
+    command: "-js -m 8222"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 5
+
+  # 2. Ingestion Service
+  ingestion:
+    build: 
+      context: ../ingestion
+      dockerfile: Dockerfile.test
+    environment:
+      - NATS_URL=nats://nats:4222
+      - INPUT_URL=test_stream.mp4
+    # 👇 FIX: Added 'sleep 300' so the container stays alive, allowing Validator to finish
+    command: >
+      sh -c "
+      echo '⚡ Generating High-Speed Test Signal...' &&
+      ffmpeg -y -f lavfi -i testsrc=size=1920x1080:rate=25 -f lavfi -i sine=frequency=1000:sample_rate=48000 -c:v libx264 -preset ultrafast -c:a pcm_f32le -t 10 test_stream.mp4 &&
+      echo '🚀 Starting Ingestion Binary...' &&
+      /app/ingestion-bin &&
+      echo '✅ Ingestion Complete. Keeping container alive for Validator...' &&
+      sleep 300
+      "
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  # 3. Denoiser Service
+  denoiser:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      nats:
+        condition: service_healthy
+
+  # 4. Validator
+  validator:
+    image: python:3.10-slim
+    command: >
+      sh -c "pip install nats-py numpy && python validator.py"
+    volumes:
+      - ./validator.py:/app/validator.py
+    working_dir: /app
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      denoiser:
+        condition: service_started

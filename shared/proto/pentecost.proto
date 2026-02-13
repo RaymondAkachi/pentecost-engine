@@ -1,0 +1,143 @@
+// shared/proto/pentecost.proto
+syntax = "proto3";
+package pentecost;
+
+// Fix: Ensure this matches where you want the Go code to live
+option go_package = "github.com/RaymondAkachi/pentecost-engine/shared/types";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// Layer 0: Ingestion
+message AudioFrame {
+  bytes pcm_data = 1;
+  int32 sample_rate = 2;
+  int64 pts = 3;  // Presentation timestamp (microseconds)
+  int64 dts = 4;  // Decode timestamp
+  google.protobuf.Timestamp captured_at = 5;
+  string source_stream_id = 6;
+}
+
+message VideoFrame {
+  bytes encoded_data = 1;  // H.264 annex-b
+  int32 width = 2;
+  int32 height = 3;
+  bool is_keyframe = 4;
+  int64 pts = 5;
+  int64 dts = 6;
+  google.protobuf.Timestamp captured_at = 7;
+}
+
+// Layer 1: ASR & Theology
+message TranscriptionSegment {
+  string text = 1;
+  float confidence = 2;
+  google.protobuf.Duration duration = 3;
+  int64 start_pts = 4;
+  int64 end_pts = 5;
+  repeated TheologicalTerm detected_terms = 6;
+  string speaker_id = 7;
+}
+
+message TheologicalTerm {
+  string term = 1;
+  string original_language = 2;  // "greek", "hebrew", "english"
+  string transliteration = 3;
+  float doctrinal_weight = 4;  // 0.0-1.0 importance
+  repeated string doctrinal_context = 5;
+}
+
+message VerifiedTranslation {
+  string original_text = 1;
+  string translated_text = 2;
+  string target_language = 3;  // ISO 639-1
+  float doctrinal_safety_score = 4;
+  repeated TranslationCorrection corrections = 5;
+  int64 processing_latency_ms = 6;
+}
+
+message TranslationCorrection {
+  string term = 1;
+  string incorrect_translation = 2;
+  string correct_translation = 3;
+  string doctrinal_reasoning = 4;
+}
+
+// Layer 2: TTS
+message SynthesisRequest {
+  string text = 2;
+  string target_language = 3;
+  EmotionalContext emotion = 4;
+  bytes reference_audio = 5;  // 10s rolling window
+  int64 reference_pts = 6;
+}
+
+message EmotionalContext {
+  float pitch_mean = 1;
+  float pitch_std = 2;
+  float energy_mean = 3;
+  float energy_std = 4;
+  float speaking_rate = 5;  // words per minute
+  EmotionClass classified_emotion = 6;
+}
+
+enum EmotionClass {
+  TEACHING = 0;
+  EXHORTATION = 1;
+  PROPHETIC_FIRE = 2;
+  CELEBRATION = 3;
+  LAMENT = 4;
+}
+
+message SynthesizedAudio {
+  bytes pcm_data = 1;
+  int32 sample_rate = 2;
+  int64 pts = 3;
+  google.protobuf.Duration duration = 4;
+  EmotionalContext applied_emotion = 5;
+  float similarity_to_reference = 6;  // Voice cloning quality
+}
+
+// Layer 3: Video Sync
+message VideoSyncRequest {
+  repeated bytes video_frames = 1;  // Encoded frames
+  bytes audio_features = 2;  // Whisper embeddings
+  ProsodyData prosody = 3;
+  int64 segment_id = 4;
+}
+
+message ProsodyData {
+  repeated float pitch_contour = 1;
+  repeated float energy_envelope = 2;
+  repeated int32 energy_peaks = 3;  // Frame indices of emphasis
+  float tempo = 4;
+}
+
+message SynchronizedVideo {
+  repeated bytes synced_frames = 1;
+  int64 segment_id = 2;
+  float sync_quality_score = 3;  // Lip-sync accuracy
+  google.protobuf.Duration processing_time = 4;
+}
+
+// Layer 4: Broadcast
+message BroadcastSegment {
+  oneof media {
+    SynchronizedVideo video = 1;
+    SynthesizedAudio audio = 2;
+  }
+  string dialect = 3;
+  int64 segment_id = 4;
+  int64 pts = 5;
+  bool is_keyframe = 6;
+  google.protobuf.Timestamp broadcast_at = 7;
+}
+
+// Metrics & Monitoring
+message PerformanceMetrics {
+  string service_name = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  map<string, float> latency_histogram = 3;
+  map<string, int64> throughput_counters = 4;
+  repeated string error_samples = 5;
+}

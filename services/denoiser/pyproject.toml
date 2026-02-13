@@ -1,0 +1,28 @@
+[project]
+name = "deepfilternet3-service"
+version = "0.1.0"
+requires-python = "==3.12.*"
+dependencies = [
+    "deepfilternet>=0.5.6",
+    "numpy==1.26.4",
+    "protobuf>=5.29.3",  # Ensure this is here
+    "pytest>=8.0.0",
+    "pytest-asyncio",
+    "torch==2.4.1",
+    "torchaudio==2.4.1",
+    "shared",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+shared = { path = "../../shared", editable = true }
+# Force UV to fetch these from the official PyTorch source
+torch = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
+
+[tool.pytest.ini_options]
+pythonpath = ["../../"]
