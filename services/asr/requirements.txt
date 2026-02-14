@@ -1,0 +1,9 @@
+torch==2.2.2
+torchaudio==2.2.2
+numpy==1.26.4
+transformers==4.40.0
+peft==0.10.0
+accelerate==0.29.3
+bitsandbytes==0.43.1
+nats-py==2.8.0
+scipy

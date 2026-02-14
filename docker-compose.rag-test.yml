@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  # 1. Message Broker (The Nervous System)
+  nats:
+    image: nats:alpine
+    command: "-js -m 8222"
+    ports: ["4222:4222", "8222:8222"]
+
+  # 2. Theological RAG (The Brain)
+  rag:
+    build: 
+      context: ./services/theology
+      dockerfile: Dockerfile
+    environment:
+      - RAG_NATS_URL=nats://nats:4222
+      - RAG_INPUT_SUBJECT=livestream.transcription.raw
+      - RAG_OUTPUT_SUBJECT=livestream.transcription.enriched
+      - RAG_SIMILARITY_THRESHOLD=1.2
+    depends_on: [nats]
+
+  # 3. Test Driver (The Simulator)
+  # This container runs the test script inside the network
+  rag-tester:
+    image: python:3.10-slim
+    working_dir: /app
+    volumes:
+      - ./tests:/app/tests
+    command: >
+      sh -c "pip install nats-py && python -u tests/test_rag_integration.py"
+    depends_on: [rag]

@@ -1,0 +1,85 @@
+import json
+import os
+
+# APOSTOLIC & PROPHETIC VOCABULARY DATABASE
+# 60+ Terms covering Greek Roots, Spirit Realm, and Doctrinal Offices.
+MEGA_GLOSSARY = [
+    # --- GREEK POWER TERMS ---
+    {"term": "Koinonia", "definition": "Deep spiritual fellowship, partnership, and communion with the Holy Spirit.", "misspellings": ["coin on here", "corn on ear", "coinonia"]},
+    {"term": "Kairos", "definition": "The opportune, appointed moment of God; divine timing interrupting chronos.", "misspellings": ["cairo", "kairose", "chiros"]},
+    {"term": "Chronos", "definition": "Sequential, chronological time; the timeline of men.", "misspellings": ["cronus", "chronus"]},
+    {"term": "Dunamis", "definition": "Inherent miracle-working power; dynamite power.", "misspellings": ["dynamis", "do na miss"]},
+    {"term": "Exousia", "definition": "Delegated authority; the legal right to act.", "misspellings": ["ex oo sia", "exo see a"]},
+    {"term": "Ischus", "definition": "Great might or physical strength driven by the spirit.", "misspellings": ["is cuss", "ish us"]},
+    {"term": "Energia", "definition": "Working power; energy in operation; the active force.", "misspellings": ["energy a", "inner gia"]},
+    {"term": "Zoe", "definition": "The God-kind of life; eternal, uncreated life.", "misspellings": ["zoey", "zone", "zo"]},
+    {"term": "Pneuma", "definition": "Spirit; breath; wind of God.", "misspellings": ["new ma", "numa"]},
+    {"term": "Hagios", "definition": "Holy; set apart; sanctified.", "misspellings": ["haggis", "hay geos"]},
+    
+    # --- HEBREW & GLORY REALM ---
+    {"term": "Kabod", "definition": "The heavy, weighty glory of God.", "misspellings": ["cupboard", "car board"]},
+    {"term": "Shekinah", "definition": "The dwelling or settling presence of God.", "misspellings": ["she kiner", "shakira"]},
+    {"term": "Chabod", "definition": "Glory; honor; weight.", "misspellings": []},
+    {"term": "Elohim", "definition": "God the Creator; the strong one.", "misspellings": ["hello him"]},
+    {"term": "Adonai", "definition": "Lord; Master; Owner.", "misspellings": ["add oh nigh"]},
+    {"term": "Ruach", "definition": "Breath; Spirit of God.", "misspellings": ["roo ack"]},
+    {"term": "Merkabah", "definition": "The war chariot of God; the throne vehicle.", "misspellings": ["merca bar"]},
+    
+    # --- SPIRIT REALM DYNAMICS ---
+    {"term": "Watchers", "definition": "A class of angelic beings that oversee the affairs of men (Daniel 4).", "misspellings": ["watch us"]},
+    {"term": "Portals", "definition": "Access points or doorways connecting the spirit realm to the earth.", "misspellings": ["potholes"]},
+    {"term": "Altars", "definition": "Platforms where the spirit realm interacts with the physical; exchange points.", "misspellings": ["alters"]},
+    {"term": "Gates", "definition": "Entry points in time or space that govern access to cities or seasons.", "misspellings": []},
+    {"term": "Thrones", "definition": "Seats of authority and governance in the spirit.", "misspellings": []},
+    {"term": "Dominions", "definition": "Ranks of spiritual authority that rule over territories.", "misspellings": ["minions"]},
+    {"term": "Territorial", "definition": "Spirits or authorities governing specific geographical regions.", "misspellings": []},
+    {"term": "Ley Lines", "definition": "Lines of spiritual energy or connectivity across the earth.", "misspellings": ["lay lines"]},
+    
+    # --- DARK KINGDOM (FOR CORRECTION) ---
+    {"term": "Necromancy", "definition": "Consulting the dead; a forbidden practice.", "misspellings": ["neck romancy"]},
+    {"term": "Divination", "definition": "Seeking knowledge of the future by supernatural means other than God.", "misspellings": ["divine nation"]},
+    {"term": "Sorcery", "definition": "The use of power (pharmakeia) to manipulate or control.", "misspellings": ["saucery"]},
+    {"term": "Python", "definition": "A constricting spirit of divination (Acts 16).", "misspellings": []},
+    
+    # --- APOSTOLIC & PRIESTLY OFFICES ---
+    {"term": "Mantle", "definition": "A spiritual covering, cloak, or authority passed down from a father.", "misspellings": ["mental", "mantel"]},
+    {"term": "Impartation", "definition": "The transference of spiritual dimensions or gifts.", "misspellings": ["in part action"]},
+    {"term": "Activation", "definition": "The stirring up of dormant spiritual gifts.", "misspellings": []},
+    {"term": "Apostolic", "definition": "Relating to the office of an Apostle; sent one; building foundation.", "misspellings": ["apple stolic"]},
+    {"term": "Prophetic", "definition": "Relating to the office of a Prophet; seeing and speaking God's mind.", "misspellings": ["pathetic"]},
+    {"term": "Priesthood", "definition": "The office of standing between God and man; offering sacrifices.", "misspellings": []},
+    {"term": "Melchizedek", "definition": "The order of the King-Priest; an eternal priesthood.", "misspellings": ["milk is a deck", "mel keys a deck"]},
+    {"term": "Oracle", "definition": "A mouthpiece of God; one who speaks divine utterances.", "misspellings": []},
+    {"term": "Legislators", "definition": "Believers who decree and establish God's will into the earth realm.", "misspellings": ["legislatures"]},
+    {"term": "Remnant", "definition": "A small remaining quantity of people preserved by God.", "misspellings": ["remnants"]},
+    {"term": "Intercessor", "definition": "One who stands in the gap to pray.", "misspellings": []},
+    
+    # --- DOCTRINAL CONCEPTS ---
+    {"term": "Alignment", "definition": "Coming into agreement with God's will, timing, and order.", "misspellings": []},
+    {"term": "Ascension", "definition": "Rising in spiritual rank; climbing the hill of the Lord.", "misspellings": ["a tension"]},
+    {"term": "Stature", "definition": "Spiritual maturity and capacity to carry weight.", "misspellings": ["statue"]},
+    {"term": "Rank", "definition": "Level of authority in the spirit realm.", "misspellings": []},
+    {"term": "Consecration", "definition": "The act of setting oneself apart for God's use.", "misspellings": ["concentration"]},
+    {"term": "Sanctification", "definition": "The process of being made holy and purified.", "misspellings": []},
+    {"term": "Ordinances", "definition": "Divine laws, decrees, or statutes set in the spirit.", "misspellings": ["audiences"]},
+    {"term": "Patterns", "definition": "Heavenly blueprints that must be replicated on earth.", "misspellings": []},
+    {"term": "Scrolls", "definition": "Spiritual records of destiny and assignment.", "misspellings": []},
+    {"term": "Iniquity", "definition": "Twistedness; sin patterns in the bloodline.", "misspellings": []},
+    {"term": "Transgression", "definition": "Willful rebellion against a known law of God.", "misspellings": []},
+    {"term": "Covenant", "definition": "A binding agreement between two parties, sealed by blood.", "misspellings": []},
+    {"term": "Dispensation", "definition": "A period of time or administration of God's dealings.", "misspellings": []},
+    {"term": "Eschatology", "definition": "The study of end times and final events.", "misspellings": ["escapology"]}
+]
+
+def seed():
+    path = "services/theology/glossary.json"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    
+    with open(path, "w") as f:
+        json.dump(MEGA_GLOSSARY, f, indent=2)
+    
+    print(f"✅ SUCCESSFULLY SEEDED {len(MEGA_GLOSSARY)} THEOLOGICAL TERMS.")
+    print(f"📍 Location: {path}")
+
+if __name__ == "__main__":
+    seed()

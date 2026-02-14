@@ -1,0 +1,11 @@
+nats-py==2.8.0
+chromadb==0.4.24
+sentence-transformers==2.6.1
+pydantic==2.6.4
+pydantic-settings==2.2.1
+structlog==24.1.0
+python-dotenv==1.0.1
+numpy==1.26.4
+pysqlite3-binary  # Critical for ChromaDB stability
+# 👇 Crucial: Tells pip to find the CPU version of torch
+torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu

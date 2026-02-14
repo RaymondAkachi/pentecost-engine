@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  # --- INFRASTRUCTURE ---
+  nats:
+    image: nats:alpine
+    command: "-js -m 8222"
+    ports: ["4222:4222", "8222:8222"]
+
+  # --- LAYER 0: INGESTION ---
+  ingestion:
+    build: 
+      context: ./services/ingestion
+      dockerfile: Dockerfile.test
+    environment:
+      - NATS_URL=nats://nats:4222
+      - INPUT_URL=file:///media/sermon_test.mp4 
+    volumes:
+      - ./services/ingestion/media:/media
+    # 👇 FIX: Changed '>' to '|' to preserve newlines for the shell script
+    command: |
+      sh -c "
+      echo '⏳ Waiting 10s for Infrastructure...' && sleep 10 &&
+      echo '🔴 Starting Broadcast (2-min Test)...' &&
+      ffmpeg -re -stream_loop -1 -i /media/sermon_test.mp4 \
+      -c:v libx264 -preset ultrafast -tune zerolatency -f h264 -bsf:v h264_mp4toannexb - \
+      -c:a pcm_f32le -ar 48000 -ac 1 -f f32le - | \
+      /app/ingestion-bin
+      "
+    depends_on: [nats]
+
+  # --- LAYER 0: DENOISER ---
+  denoiser:
+    build:
+      context: ./services/denoiser
+      dockerfile: Dockerfile
+    environment: {NATS_URL: "nats://nats:4222"}
+    depends_on: [nats]
+
+  # --- LAYER 1: PROPHETIC ASR ---
+  asr:
+    build:
+      context: ./services/asr
+      dockerfile: Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+    volumes:
+      - ./services/asr/adapter:/app/adapter
+    # CPU Mode enabled for stability
+    depends_on: [denoiser]
+
+  # --- VALIDATOR ---
+  validator:
+    image: python:3.10-slim
+    # 👇 FIX: Used '|' here as well for safety
+    command: |
+      sh -c "pip install nats-py && python -c '
+      import asyncio
+      import nats
+      import json
+      
+      async def main():
+          try:
+              print(\"🔎 Validator Connecting...\")
+              nc = await nats.connect(\"nats://nats:4222\")
+              js = nc.jetstream()
+              print(\"✅ Validator Ready. Listening...\")
+              
+              async def cb(msg):
+                  data = json.loads(msg.data.decode())
+                  text = data.get(\"text\", \"\")
+                  if len(text) > 2:
+                      print(f\"🗣️  ASR: {text}\")
+              
+              await js.subscribe(\"livestream.transcription.raw\", cb=cb)
+              await asyncio.Future()
+          except Exception as e:
+              print(f\"❌ Error: {e}\")
+      
+      if __name__ == \"__main__\": asyncio.run(main())
+      '"
+    depends_on: [asr]
