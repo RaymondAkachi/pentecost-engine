@@ -2,7 +2,6 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# System dependencies for audio processing
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     libsndfile1 \
@@ -12,9 +11,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pre-load Whisper Model (Optional but recommended to speed up boot)
-# This prevents downloading 3GB every time
-RUN python -c "from transformers import WhisperForConditionalGeneration; WhisperForConditionalGeneration.from_pretrained('openai/whisper-large-v3')"
+# Create directories
+RUN mkdir -p /app/voices /app/model
 
 COPY src/ ./src/
 ENV PYTHONPATH=/app

@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  # 1. Broker (With Fix applied)
+  nats:
+    image: nats:alpine
+    command: "-js -m 8222 --max_payload 8MB"
+    ports: ["4222:4222", "8222:8222"]
+
+  # 2. TTS Service (Subject Under Test)
+  tts:
+    build:
+      context: ./services/tts
+      dockerfile: Dockerfile
+    environment:
+      - TTS_NATS_URL=nats://nats:4222
+      - TTS_INPUT_SUBJECT=livestream.translation.done
+    volumes:
+      - ./services/tts/voices:/app/voices # Mount voices so logic runs
+    depends_on: [nats]
+
+  # 3. Test Driver
+  tts-tester:
+    image: python:3.10-slim
+    volumes:
+      - ./tests:/app/tests
+    working_dir: /app
+    environment:
+      - NATS_URL=nats://nats:4222
+    command: >
+      sh -c "pip install nats-py && python -u tests/test_tts_independent.py"
+    depends_on: [tts]

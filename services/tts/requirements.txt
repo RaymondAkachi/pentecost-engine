@@ -1,0 +1,12 @@
+nats-py==2.8.0
+torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+transformers==4.39.3
+numpy==1.26.4
+scipy==1.13.0
+soundfile==0.12.1
+librosa==0.10.1
+pydantic==2.6.4
+pydantic-settings==2.2.1
+structlog==24.1.0
+python-dotenv==1.0.1

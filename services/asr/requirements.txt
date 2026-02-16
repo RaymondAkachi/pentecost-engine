@@ -1,9 +1,29 @@
-torch==2.2.2
-torchaudio==2.2.2
-numpy==1.26.4
-transformers==4.40.0
+# # Core AI Libraries
+# torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+# torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+# transformers==4.39.3
+# # We pin PEFT to a version that is stable but modern enough for Large-V3
+# peft==0.10.0
+# accelerate==0.28.0
+
+# # Application Logic
+# nats-py==2.8.0
+# numpy==1.26.4
+# scipy==1.13.0
+# more-itertools==10.2.0
+# structlog==24.1.0
+
+
+torch==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+torchaudio==2.2.2 --extra-index-url https://download.pytorch.org/whl/cpu
+transformers==4.39.3
 peft==0.10.0
-accelerate==0.29.3
-bitsandbytes==0.43.1
+accelerate==0.28.0
 nats-py==2.8.0
-scipy
+numpy==1.26.4
+pydantic==2.6.4
+pydantic-settings==2.2.1
+structlog==24.1.0
+python-dotenv==1.0.1
+librosa==0.10.1
+soundfile==0.12.1
