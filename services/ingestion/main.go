@@ -7,242 +7,386 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/exec"
+	"os/signal"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/nats-io/nats.go"
 )
 
-// Architecture Constants
+// --- CONFIGURATION (Pentecost v2.0) ---
 const (
-	VideoSubject        = "livestream.video.raw"
-	AudioSubject        = "livestream.audio.raw"
-	AudioSampleRate     = 48000
-	AudioFrameSize      = 960 // 20ms @ 48kHz
-	AudioBytesPerSample = 4   // Float32 = 4 bytes
+	NatsURL        = "nats://nats:4222"
+	VideoSubject   = "livestream.video.raw"
+	AudioSubject   = "livestream.audio.raw"
+	VideoPort      = ":4000"
+	AudioPort      = ":4001"
+	BufferDuration = 60 * time.Second // The "Pentecost Buffer"
 )
 
-type IngestionService struct {
-	nc        *nats.Conn
-	js        nats.JetStreamContext
-	inputURL  string
-	startTime time.Time
+// --- PENTECOST BUFFER IMPLEMENTATION ---
+type StreamSegment struct {
+	Data       []byte
+	Timestamp  time.Time
+	IsKeyframe bool
+	PTS        int64
 }
 
-func NewIngestionService(natsURL, inputURL string) (*IngestionService, error) {
-	log.Printf("🔌 Connecting to NATS at %s...", natsURL)
-	nc, err := nats.Connect(natsURL)
-	if err != nil {
-		return nil, fmt.Errorf("nats connect: %w", err)
+type PentecostBuffer struct {
+	mu       sync.Mutex
+	segments []*StreamSegment
+	duration time.Duration
+}
+
+func NewPentecostBuffer(duration time.Duration) *PentecostBuffer {
+	return &PentecostBuffer{
+		duration: duration,
+		segments: make([]*StreamSegment, 0, 1000),
 	}
+}
+
+func (pb *PentecostBuffer) Add(seg *StreamSegment) {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	pb.segments = append(pb.segments, seg)
+
+	// Safety: Prevent OOM if consumer dies
+	if len(pb.segments) > 3000 {
+		pb.segments = pb.segments[1:] // Drop oldest
+	}
+}
+
+func (pb *PentecostBuffer) PopReady() []*StreamSegment {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	now := time.Now()
+	var ready []*StreamSegment
+	cutoffIndex := 0
+
+	for i, seg := range pb.segments {
+		if now.Sub(seg.Timestamp) >= pb.duration {
+			ready = append(ready, seg)
+			cutoffIndex = i + 1
+		} else {
+			break
+		}
+	}
+
+	if cutoffIndex > 0 {
+		pb.segments = pb.segments[cutoffIndex:]
+	}
+	return ready
+}
+
+// --- SERVICE ---
+type IngestionService struct {
+	nc          *nats.Conn
+	js          nats.JetStreamContext
+	inputURL    string
+	videoBuffer *PentecostBuffer
+	audioBuffer *PentecostBuffer
+}
+
+func main() {
+	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-test") {
+		return
+	}
+	RunService()
+}
+
+func RunService() {
+	log.Println("🚀 Starting Pentecost Ingestion Service v2.0")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		log.Println("🛑 Shutdown signal received")
+		cancel()
+	}()
+
+	// 1. Connect to NATS
+	var nc *nats.Conn
+	var err error
+	for i := 0; i < 10; i++ {
+		nc, err = nats.Connect(os.Getenv("NATS_URL"), nats.Name("Pentecost-Ingest"))
+		if err == nil {
+			break
+		}
+		log.Printf("⚠️ NATS unavailable, retrying (%d/10)...", i+1)
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatal("❌ NATS Connection Failed:", err)
+	}
+	defer nc.Close()
 
 	js, err := nc.JetStream()
 	if err != nil {
-		return nil, fmt.Errorf("jetstream init: %w", err)
-	}
-	log.Println("✅ NATS Connected & JetStream Ready")
-
-	return &IngestionService{
-		nc:       nc,
-		js:       js,
-		inputURL: inputURL,
-	}, nil
-}
-
-func (s *IngestionService) Start(ctx context.Context) error {
-	// 1. Create OS Pipes
-	vRead, vWrite, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("video pipe error: %w", err)
-	}
-	aRead, aWrite, err := os.Pipe()
-	if err != nil {
-		return fmt.Errorf("audio pipe error: %w", err)
+		log.Fatal("❌ JetStream Init Failed:", err)
 	}
 
-	// 2. Configure FFmpeg (DEBUG MODE ENABLED)
-	log.Printf("🎥 Starting FFmpeg for input: %s", s.inputURL)
-	ffmpeg := exec.CommandContext(ctx, "ffmpeg",
-		"-hide_banner",
-		"-loglevel", "info", // 👈 CHANGED: Enable Info logs to see what's happening
-		"-re", // Read at native speed
-		"-i", s.inputURL,
+	createStream(js, "LIVESTREAM_VIDEO", VideoSubject)
+	createStream(js, "LIVESTREAM_AUDIO", AudioSubject)
 
-		// Video Output
-		"-map", "0:v:0",
-		"-c:v", "copy",
-		"-bsf:v", "h264_mp4toannexb",
-		"-f", "h264",
-		"pipe:3",
-
-		// Audio Output
-		"-map", "0:a:0",
-		"-c:a", "pcm_f32le",
-		"-ar", "48000",
-		"-ac", "1",
-		"-f", "f32le",
-		"pipe:4",
-	)
-
-	// 3. Capture FFmpeg Stderr to see errors
-	ffmpeg.Stderr = os.Stderr
-	ffmpeg.Stdout = os.Stdout
-
-	// 4. Attach Pipes (FD 3 and 4)
-	ffmpeg.ExtraFiles = []*os.File{vWrite, aWrite}
-
-	s.startTime = time.Now().UTC()
-
-	if err := ffmpeg.Start(); err != nil {
-		return fmt.Errorf("ffmpeg start failed: %w", err)
+	svc := &IngestionService{
+		nc:          nc,
+		js:          js,
+		inputURL:    os.Getenv("INPUT_URL"),
+		videoBuffer: NewPentecostBuffer(BufferDuration),
+		audioBuffer: NewPentecostBuffer(BufferDuration),
 	}
-	log.Println("🚀 FFmpeg Process Started")
 
-	// Close write ends in Go so we get EOF when FFmpeg finishes
-	vWrite.Close()
-	aWrite.Close()
+	if svc.inputURL == "" {
+		svc.inputURL = "https://www.youtube.com/watch?v=jfKfPfyJRdk"
+	}
 
+	// 3. Start Broadcaster
+	go svc.startBroadcaster(ctx)
+
+	// 4. Start Ingestion
 	var wg sync.WaitGroup
+	videoReady := make(chan struct{})
+	audioReady := make(chan struct{})
+
 	wg.Add(2)
+	go func() { defer wg.Done(); svc.startVideoServer(ctx, videoReady) }()
+	go func() { defer wg.Done(); svc.startAudioServer(ctx, audioReady) }()
 
-	// Video Routine
+	log.Println("⏳ Waiting for TCP listeners...")
+	<-videoReady
+	<-audioReady
+	log.Println("✅ TCP Listeners Active")
+
+	// 5. Run FFmpeg Loop
+	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		log.Println("📺 Starting Video Processor...")
-		s.processVideo(vRead)
-		log.Println("🛑 Video Processor Finished")
+		svc.runFFmpegLoop(ctx)
 	}()
 
-	// Audio Routine
-	go func() {
-		defer wg.Done()
-		log.Println("🔊 Starting Audio Processor...")
-		s.processAudio(aRead)
-		log.Println("🛑 Audio Processor Finished")
-	}()
-
-	err = ffmpeg.Wait()
-	log.Printf("🏁 FFmpeg Process Exited. Error: %v", err)
 	wg.Wait()
-	return err
 }
 
-func (s *IngestionService) processVideo(reader *os.File) {
-	defer reader.Close()
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 1024*1024), 10*1024*1024)
-	scanner.Split(splitNALUnits)
+func (s *IngestionService) startBroadcaster(ctx context.Context) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 
-	count := 0
-	for scanner.Scan() {
-		count++
-		frameData := scanner.Bytes()
-		payload := make([]byte, len(frameData))
-		copy(payload, frameData)
+	log.Printf("⏳ Pentecost Buffer Active: Holding streams for %v...", BufferDuration)
 
-		elapsed := time.Since(s.startTime)
-		pts := int64(elapsed.Seconds() * 90000)
-
-		msg := &nats.Msg{
-			Subject: VideoSubject,
-			Data:    payload,
-			Header: nats.Header{
-				"PTS":       []string{fmt.Sprintf("%d", pts)},
-				"Timestamp": []string{time.Now().UTC().Format(time.RFC3339Nano)},
-			},
-		}
-
-		if _, err := s.js.PublishMsg(msg); err != nil {
-			log.Printf("❌ Video Publish Error: %v", err)
-		} else if count%24 == 0 {
-			log.Printf("📤 Published Video Frame #%d (PTS: %d)", count, pts)
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		log.Printf("❌ Video Scan Error: %v", err)
-	}
-}
-
-func (s *IngestionService) processAudio(reader *os.File) {
-	defer reader.Close()
-	frameSize := AudioFrameSize * AudioBytesPerSample
-	buf := make([]byte, frameSize)
-	count := 0
+	hasBroadcast := false
 
 	for {
-		_, err := io.ReadFull(reader, buf)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("❌ Audio Read Error: %v", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			readyVideo := s.videoBuffer.PopReady()
+			for _, seg := range readyVideo {
+				msg := &nats.Msg{
+					Subject: VideoSubject,
+					Data:    seg.Data,
+					Header:  nats.Header{},
+				}
+				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
+				msg.Header.Add("keyframe", fmt.Sprintf("%t", seg.IsKeyframe))
+				s.js.PublishMsgAsync(msg)
 			}
-			break
-		}
-		count++
 
-		payload := make([]byte, frameSize)
-		copy(payload, buf)
+			// Only log sparsely to avoid spam
+			if len(readyVideo) > 0 {
+				if !hasBroadcast {
+					log.Println("📡 BROADCAST LIVE: First frames released from buffer!")
+					hasBroadcast = true
+				}
+			}
 
-		elapsed := time.Since(s.startTime)
-		pts := int64(elapsed.Seconds() * 90000)
-
-		msg := &nats.Msg{
-			Subject: AudioSubject,
-			Data:    payload,
-			Header: nats.Header{
-				"PTS":         []string{fmt.Sprintf("%d", pts)},
-				"Sample-Rate": []string{"48000"},
-			},
-		}
-
-		if _, err := s.js.PublishMsg(msg); err != nil {
-			log.Printf("❌ Audio Publish Error: %v", err)
-		} else if count%50 == 0 { // Log every 1 second of audio
-			log.Printf("📤 Published Audio Chunk #%d (PTS: %d)", count, pts)
+			readyAudio := s.audioBuffer.PopReady()
+			for _, seg := range readyAudio {
+				msg := &nats.Msg{
+					Subject: AudioSubject,
+					Data:    seg.Data,
+					Header:  nats.Header{},
+				}
+				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
+				s.js.PublishMsgAsync(msg)
+			}
 		}
 	}
 }
 
-func splitNALUnits(data []byte, atEOF bool) (advance int, token []byte, err error) {
-	if atEOF && len(data) == 0 {
-		return 0, nil, nil
+func (s *IngestionService) runFFmpegLoop(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+			streamURL := s.inputURL
+			if strings.Contains(s.inputURL, "youtube.com") || strings.Contains(s.inputURL, "youtu.be") {
+				log.Println("🔍 Resolving YouTube URL with yt-dlp...")
+				// Force HLS to handle live streams better
+				cmd := exec.CommandContext(ctx, "yt-dlp", "-f", "best[height<=720]", "-g", s.inputURL)
+				out, err := cmd.Output()
+				if err != nil {
+					log.Printf("❌ yt-dlp failed: %v. Retrying in 5s...", err)
+					time.Sleep(5 * time.Second)
+					continue
+				}
+				streamURL = strings.TrimSpace(string(out))
+				log.Println("✅ Resolved Stream URL")
+			}
+
+			log.Println("🎬 Starting FFmpeg Ingestion...")
+
+			args := []string{
+				"-loglevel", "error", // FIX: Silence the "Skip AD" spam
+				"-re",
+				"-i", streamURL,
+				"-map", "0:v", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264", "tcp://127.0.0.1:4000",
+				"-map", "0:a", "-c:a", "pcm_f32le", "-ar", "16000", "-ac", "1", "-f", "f32le", "tcp://127.0.0.1:4001",
+			}
+
+			cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+			cmd.Stderr = os.Stderr
+			if err := cmd.Run(); err != nil {
+				log.Printf("⚠️ FFmpeg exited: %v", err)
+			}
+
+			time.Sleep(2 * time.Second)
+		}
 	}
-	startSeq := []byte{0, 0, 0, 1}
-	offset := 0
-	if bytes.HasPrefix(data, startSeq) {
-		offset = 4
+}
+
+func (s *IngestionService) startVideoServer(ctx context.Context, ready chan<- struct{}) {
+	ln, err := net.Listen("tcp", VideoPort)
+	if err != nil {
+		log.Fatal(err)
 	}
-	next := bytes.Index(data[offset:], startSeq)
-	if next == -1 {
+	close(ready)
+	defer ln.Close()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleVideo(conn)
+	}
+}
+
+func (s *IngestionService) handleVideo(conn net.Conn) {
+	defer conn.Close()
+	log.Println("🔌 Video Stream Connected! (Buffering starts now)") // FIX: Immediate Feedback
+
+	scanner := bufio.NewScanner(conn)
+	buf := make([]byte, 10*1024*1024)
+	scanner.Buffer(buf, 10*1024*1024)
+
+	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		delimiter := []byte{0, 0, 0, 1}
+		if i := bytes.Index(data, delimiter); i >= 0 {
+			if i > 0 {
+				return i, data[:i], nil
+			}
+			if j := bytes.Index(data[4:], delimiter); j >= 0 {
+				return j + 4, data[:j+4], nil
+			}
+		}
 		if atEOF {
 			return len(data), data, nil
 		}
 		return 0, nil, nil
+	})
+
+	start := time.Now()
+	for scanner.Scan() {
+		frame := make([]byte, len(scanner.Bytes()))
+		copy(frame, scanner.Bytes())
+
+		pts := time.Since(start).Milliseconds()
+		isKey := false
+		if len(frame) > 4 {
+			nal := frame[4] & 0x1F
+			if nal == 5 || nal == 7 || nal == 8 {
+				isKey = true
+			}
+		}
+
+		s.videoBuffer.Add(&StreamSegment{
+			Data:       frame,
+			Timestamp:  time.Now(),
+			PTS:        pts,
+			IsKeyframe: isKey,
+		})
 	}
-	fullFrameLen := offset + next
-	return fullFrameLen, data[:fullFrameLen], nil
 }
 
-func main() {
-	log.SetFlags(log.Ltime | log.Lmicroseconds) // High precision timestamps
-
-	natsURL := os.Getenv("NATS_URL")
-	if natsURL == "" {
-		natsURL = "nats://localhost:4222"
-	}
-	inputURL := os.Getenv("INPUT_URL")
-	if inputURL == "" {
-		log.Fatal("INPUT_URL environment variable required")
-	}
-
-	service, err := NewIngestionService(natsURL, inputURL)
+func (s *IngestionService) startAudioServer(ctx context.Context, ready chan<- struct{}) {
+	ln, err := net.Listen("tcp", AudioPort)
 	if err != nil {
-		log.Fatalf("❌ FATAL: Could not start service: %v", err)
+		log.Fatal(err)
 	}
+	close(ready)
+	defer ln.Close()
 
-	ctx := context.Background()
-	if err := service.Start(ctx); err != nil {
-		log.Fatalf("❌ FATAL: Runtime error: %v", err)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go s.handleAudio(conn)
+	}
+}
+
+func (s *IngestionService) handleAudio(conn net.Conn) {
+	defer conn.Close()
+	log.Println("🔌 Audio Stream Connected!") // FIX: Immediate Feedback
+
+	// 16kHz * 1ch * 4bytes = 64000 bytes/sec
+	// 0.1s chunk = 6400 bytes
+	const ChunkSize = 6400
+	buf := make([]byte, ChunkSize)
+	var totalBytes int64 = 0
+
+	for {
+		n, err := io.ReadFull(conn, buf) // FIX: Use ReadFull
+		if err != nil {
+			return
+		}
+
+		dataCopy := make([]byte, n)
+		copy(dataCopy, buf[:n])
+
+		// Correct PTS calculation
+		pts := (totalBytes * 1000) / (16000 * 4 * 1)
+		totalBytes += int64(n)
+
+		s.audioBuffer.Add(&StreamSegment{
+			Data:      dataCopy,
+			Timestamp: time.Now(),
+			PTS:       pts,
+		})
+	}
+}
+
+func createStream(js nats.JetStreamContext, name, subject string) {
+	_, err := js.StreamInfo(name)
+	if err != nil {
+		js.AddStream(&nats.StreamConfig{
+			Name:     name,
+			Subjects: []string{subject},
+			MaxAge:   5 * time.Minute,
+			Storage:  nats.MemoryStorage,
+		})
 	}
 }

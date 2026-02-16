@@ -1,6 +1,6 @@
 module github.com/RaymondAkachi/pentecost-engine/ingestion
 
-go 1.25.7
+go 1.22
 
 require github.com/nats-io/nats.go v1.48.0
 

@@ -1,11 +1,8 @@
-# docker-compose.test.yml
 version: '3.8'
 
 services:
   nats:
-    # Use 'alpine' tag to ensure 'wget' is available for the healthcheck
     image: nats:alpine
-    # ADDED '-m 8222': This turns on the HTTP monitoring port
     command: "-js -m 8222"
     ports:
       - "4222:4222"
@@ -23,7 +20,7 @@ services:
       dockerfile: Dockerfile.test
     environment:
       - NATS_URL=nats://nats:4222
-      - INPUT_URL=test_fixture.mp4
+      # Use a 24/7 stream to guarantee data
+      - INPUT_URL=https://www.youtube.com/watch?v=jfKfPfyJRdk
     depends_on:
-      nats:
-        condition: service_healthy
+      - nats
