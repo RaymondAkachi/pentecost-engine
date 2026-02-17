@@ -1,7 +1,7 @@
 version: '3.8'
 
 services:
-  # 1. Message Broker (NATS JetStream)
+  # 1. Message Broker
   nats:
     image: nats:alpine
     container_name: pentecost-nats
@@ -15,8 +15,7 @@ services:
       timeout: 2s
       retries: 5
 
-  # 2. Ingestion Service (Go - Layer 0)
-  # Updated to run the ACTUAL production binary, not a test signal.
+  # 2. Ingestion Service
   ingestion:
     build:
       context: ./services/ingestion
@@ -24,7 +23,6 @@ services:
     container_name: pentecost-ingestion
     environment:
       - NATS_URL=nats://nats:4222
-      # Default: Lofi Girl (Safe 24/7 stream). Change to Apostle's URL for live test.
       - INPUT_URL=https://www.youtube.com/watch?v=jfKfPfyJRdk
     depends_on:
       nats:
@@ -34,8 +32,7 @@ services:
         limits:
           memory: 512M
 
-  # 3. Denoiser Service (Python/DTLN - Layer 0.5)
-  # Subscribes to 'livestream.audio.raw', Publishes 'livestream.audio.denoised'
+  # 3. Denoiser Service
   denoiser:
     build:
       context: ./services/denoiser
@@ -49,48 +46,22 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0' # DTLN is lightweight
+          cpus: '1.0'
           memory: 512M
 
   # 4. Pipeline Validator (Quality Control)
-  # Listens to the FINAL output to ensure the whole chain is working.
   validator:
     image: python:3.10-slim
     container_name: pentecost-validator
+    working_dir: /app
+    # Fix: Ensure dependencies are installed before running
     command: >
-      sh -c "
-      pip install nats-py numpy &&
-      cat <<EOF > validator.py
-      import asyncio, nats, sys
-      async def main():
-          print('🔎 Connecting to NATS...')
-          try:
-              nc = await nats.connect('nats://nats:4222')
-          except:
-              print('❌ NATS Connection Failed')
-              sys.exit(1)
-          
-          js = nc.jetstream()
-          print('✅ Validator Connected. Listening for DENOISED audio...')
-          
-          count = 0
-          async def cb(msg):
-              nonlocal count
-              count += 1
-              pts = msg.header.get('pts', 'N/A')
-              print(f'✨ [VALIDATOR] Received Denoised Frame #{count} | PTS: {pts} | Size: {len(msg.data)} bytes')
-          
-          # Subscribe to the OUTPUT of the Denoiser
-          await js.subscribe('livestream.audio.denoised', cb=cb)
-          
-          # Keep alive for observation
-          while True: await asyncio.sleep(1)
-
-      if __name__ == '__main__':
-          asyncio.run(main())
-      EOF
-      python -u validator.py
-      "
+      sh -c "pip install nats-py numpy && python -u validator.py"
+    volumes:
+      # Mount the local validator.py into the container
+      - ./validator.py:/app/validator.py
+    environment:
+      - NATS_URL=nats://nats:4222
     depends_on:
       denoiser:
         condition: service_started
