@@ -1,0 +1,12 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+# Install nats-py during build (guaranteed internet access)
+RUN pip install --no-cache-dir nats-py
+
+# Copy tests
+COPY . /app/tests
+
+# Run immediately (No pip install here!)
+CMD ["python", "-u", "tests/test_translation_independent.py"]

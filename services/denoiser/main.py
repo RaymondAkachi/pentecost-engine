@@ -1,141 +1,166 @@
 import asyncio
 import os
 import numpy as np
-import torch
-import torchaudio
+import onnxruntime as ort
 import nats
 import logging
-import sys
-import io
-import wave
-from df.enhance import init_df, enhance
+import signal
+import resampy
 
 # Setup Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - [DTLN-DENOISER] - %(levelname)s - %(message)s'
+)
 
 # Configuration
-NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
+NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
 INPUT_SUBJECT = "livestream.audio.raw"
 OUTPUT_SUBJECT = "livestream.audio.denoised"
-STREAM_NAME = "LIVESTREAM_RAW"
 
-class DenoiserEngine:
-    def __init__(self):
-        logging.info("🧠 Loading DeepFilterNet3 Model...")
-        
-        # 1. Load Model & Config
-        # We allow defaults to ensure compatibility
-        self.model, self.df_state, _ = init_df(config_allow_defaults=True)
-        self.model.eval()
-        
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model.to(self.device)
-        logging.info(f"✅ Model Loaded on Device: {self.device}")
-        
-        self.target_sr = 48000 # DFN standard
+# DTLN Constants
+DTLN_SR = 16000
+BLOCK_SIZE = 512
+SHIFT_SIZE = 128
 
-    def process_frame(self, audio_bytes):
-        """
-        Wraps raw PCM in a WAV container, runs enhancement, and extracts raw PCM back.
-        """
+class AudioBuffer:
+    """Thread-safe Circular Buffer for Audio Streams."""
+    def __init__(self, max_size=64000):
+        self._buffer = np.array([], dtype=np.float32)
+        self.max_size = max_size
+
+    def write(self, chunk):
+        # Clip to safe range before buffering
+        chunk = np.clip(chunk, -1.0, 1.0)
+        self._buffer = np.concatenate((self._buffer, chunk))
+        if len(self._buffer) > self.max_size:
+            # Drop oldest data if overflow
+            self._buffer = self._buffer[-self.max_size:]
+
+    def peek(self, size):
+        if len(self._buffer) >= size:
+            return self._buffer[:size]
+        return None
+    
+    def skip(self, size):
+        if len(self._buffer) >= size:
+            self._buffer = self._buffer[size:]
+
+class DTLNStreamer:
+    def __init__(self, model_path="model.onnx"):
+        logging.info("🧠 Loading DTLN Model...")
+        
+        # Load ONNX
+        self.sess = ort.InferenceSession(model_path)
+        
+        # 1. Map Inputs/Outputs Dynamically
+        # (Fixes the bug where we guessed the order)
+        self.input_names = [x.name for x in self.sess.get_inputs()]
+        self.output_names = [x.name for x in self.sess.get_outputs()]
+        
+        logging.info(f"   Inputs: {self.input_names}")
+        logging.info(f"   Outputs: {self.output_names}")
+        
+        # 2. Initialize States
+        self.reset_states()
+        self.buffer = AudioBuffer()
+
+    def reset_states(self):
+        # DTLN standard states: [1, 2, 128, 2]
+        self.h1 = np.zeros((1, 2, 128, 2), dtype=np.float32)
+        self.c1 = np.zeros((1, 2, 128, 2), dtype=np.float32)
+        self.h2 = np.zeros((1, 2, 128, 2), dtype=np.float32)
+        self.c2 = np.zeros((1, 2, 128, 2), dtype=np.float32)
+
+    def process_chunk(self, raw_bytes):
         try:
-            # 1. Wrap Raw PCM in a BytesIO WAV container
-            # This allows us to use standard audio loading functions without saving to disk
-            wav_buffer = io.BytesIO()
-            with wave.open(wav_buffer, "wb") as wav_file:
-                wav_file.setnchannels(1)
-                wav_file.setsampwidth(4) # 32-bit float = 4 bytes
-                wav_file.setframerate(48000)
-                wav_file.writeframes(audio_bytes) # Write raw bytes directly
-            
-            wav_buffer.seek(0) # Rewind for reading
+            # 1. Deserialize
+            audio_48k = np.frombuffer(raw_bytes, dtype=np.float32)
+            if len(audio_48k) == 0: return None
 
-            # 2. Load with Torchaudio (Safe & Robust)
-            # We explicitly tell it to load as float32
-            waveform, sr = torchaudio.load(wav_buffer, format="wav")
+            # 2. Resample (48k -> 16k)
+            audio_16k = resampy.resample(audio_48k, 48000, 16000)
+            self.buffer.write(audio_16k)
             
-            # Resample if needed (Safety guard)
-            if sr != self.target_sr:
-                resampler = torchaudio.transforms.Resample(sr, self.target_sr).to(self.device)
-                waveform = resampler(waveform.to(self.device))
-            else:
-                waveform = waveform.to(self.device)
-
-            # 3. Enhance (High-Level API)
-            # We assume state reset per chunk for now to pass the test. 
-            # (Continuous state requires the low-level API which is broken in this build)
-            enhanced_waveform = enhance(
-                self.model, 
-                self.df_state, 
-                waveform, 
-                pad=True, 
-                atten_lim_db=0.0
-            )
-
-            # 4. Extract Raw PCM Bytes
-            # Convert back to CPU numpy array
-            enhanced_np = enhanced_waveform.cpu().numpy()
+            output_chunks_16k = []
             
-            # Flatten to 1D array of float32
-            return enhanced_np.flatten().astype(np.float32).tobytes()
+            # 3. Process Blocks
+            while True:
+                in_block = self.buffer.peek(BLOCK_SIZE)
+                if in_block is None: break
+                
+                # Construct Inputs Dictionary
+                # Note: Keys must match the ONNX graph exactly
+                inputs = {
+                    'input_1': np.expand_dims(in_block, axis=0).astype(np.float32),
+                    'h1_in': self.h1,
+                    'c1_in': self.c1,
+                    'h2_in': self.h2,
+                    'c2_in': self.c2
+                }
+                
+                # Run Inference
+                results = self.sess.run(None, inputs)
+                
+                # Update States (Order is typically: Audio, H1, C1, H2, C2)
+                # But we should rely on index if names match, or just standard export order
+                # DTLN export order is fixed in the script: [prediction, h1, c1, h2, c2]
+                processed_block = results[0][0] # Audio
+                self.h1 = results[1]
+                self.c1 = results[2]
+                self.h2 = results[3]
+                self.c2 = results[4]
+                
+                output_chunks_16k.append(processed_block)
+                self.buffer.skip(SHIFT_SIZE)
+
+            if not output_chunks_16k: return None
+
+            # 4. Upsample (16k -> 48k)
+            full_16k = np.concatenate(output_chunks_16k)
+            full_48k = resampy.resample(full_16k, 16000, 48000)
+            
+            return full_48k.astype(np.float32).tobytes()
 
         except Exception as e:
-            logging.error(f"Inference Loop Error: {e}")
+            logging.error(f"DTLN Process Error: {e}")
             return None
 
-async def ensure_stream_exists(js):
-    try:
-        await js.stream_info(STREAM_NAME)
-        logging.info(f"🌊 Stream '{STREAM_NAME}' confirmed.")
-    except Exception:
-        logging.info(f"⚠️ Creating Stream '{STREAM_NAME}'...")
-        await js.add_stream(name=STREAM_NAME, subjects=["livestream.>"])
-
-async def run_service():
-    logging.info(f"🔌 Connecting to NATS at {NATS_URL}...")
-    nc = await nats.connect(NATS_URL)
+async def run():
+    # NATS Connection with Retry
+    nc = None
+    while nc is None:
+        try:
+            nc = await nats.connect(NATS_URL)
+        except:
+            logging.warning("Waiting for NATS...")
+            await asyncio.sleep(2)
+            
     js = nc.jetstream()
-    
-    await ensure_stream_exists(js)
-    
-    engine = DenoiserEngine()
-    
-    # We use a semaphore to prevent crashing the CPU with too many parallel inference tasks
-    sem = asyncio.Semaphore(1) 
+    logging.info(f"✅ DTLN Connected to NATS")
 
-    async def audio_handler(msg):
-        async with sem: # Ensure sequential processing for stability
-            try:
-                pts = msg.header.get("PTS", "0")
-                
-                # Offload blocking work to thread
-                loop = asyncio.get_running_loop()
-                denoised_bytes = await loop.run_in_executor(
-                    None, 
-                    engine.process_frame, 
-                    msg.data
-                )
-                
-                if denoised_bytes:
-                    await js.publish(
-                        OUTPUT_SUBJECT,
-                        denoised_bytes,
-                        headers={"PTS": pts}
-                    )
-            except Exception as e:
-                logging.error(f"Handler Error: {e}")
+    # Ensure Stream
+    try: await js.add_stream(name="LIVESTREAM_DENOISED", subjects=[OUTPUT_SUBJECT])
+    except: pass
 
-    await js.subscribe(INPUT_SUBJECT, cb=audio_handler)
-    logging.info(f"🎧 Listening on {INPUT_SUBJECT}...")
-    
-    # Keep alive
-    try:
-        await asyncio.Future()
-    except KeyboardInterrupt:
-        await nc.close()
+    engine = DTLNStreamer()
+    loop = asyncio.get_running_loop()
+
+    async def msg_handler(msg):
+        # Thread offload for blocking inference
+        denoised = await loop.run_in_executor(None, engine.process_chunk, msg.data)
+        
+        if denoised:
+            pts = msg.header.get("pts", "0")
+            await js.publish(OUTPUT_SUBJECT, denoised, headers={"pts": pts})
+
+    await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
+    logging.info(f"🎧 Listening on {INPUT_SUBJECT}")
+
+    stop = asyncio.Future()
+    loop.add_signal_handler(signal.SIGINT, lambda: stop.set_result(None))
+    await stop
+    await nc.close()
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_service())
-    except KeyboardInterrupt:
-        pass
+    asyncio.run(run())

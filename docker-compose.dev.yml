@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  # --- TRANSLATION SERVICE ---
+  translation:
+    image: pentecost-engine-translation:latest
+    volumes:
+      - ./services/translation/src:/app/src
+    command: python -u -m src.main
+    environment:
+      - TRANS_NATS_URL=nats://nats:4222
+      - TRANS_INPUT_SUBJECT=livestream.transcription.enriched
+      - TRANS_OUTPUT_SUBJECT_PREFIX=livestream.translation
+      # 👇 CRITICAL FIXES FOR C++ DEADLOCK
+      - OMP_NUM_THREADS=1
+      - CT2_VERBOSE=1  # This will print C++ logs if it hangs
+    depends_on: [nats]
+
+  # --- TEST DRIVER ---
+  translation-tester:
+    image: python:3.10-slim
+    volumes:
+      - ./tests:/app/tests
+    working_dir: /app
+    environment:
+      - NATS_URL=nats://nats:4222
+    # Pre-install nats-py
+    command: >
+      sh -c "pip install nats-py && python -u tests/test_translation_independent.py"
+    depends_on: [translation]
+
+  # --- INFRASTRUCTURE ---
+  nats:
+    image: nats:alpine
+    command: "-js -m 8222 --store_dir /tmp/nats"
+    ports: ["4222:4222", "8222:8222"]

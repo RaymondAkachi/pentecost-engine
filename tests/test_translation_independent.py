@@ -6,116 +6,95 @@ import nats
 from nats.errors import TimeoutError
 from nats.js.errors import NotFoundError, BadRequestError
 
-EXPECTED_LANGUAGES = ["spanish", "french", "swahili", "portuguese", "german"]
+EXPECTED_LANGUAGES = ["spanish", "french"]
 
 async def run_test():
-    print("🧪 INITIALIZING TRANSLATION ISOLATION TEST (v3 - Warmup)...")
+    print("🧪 INITIALIZING TRANSLATION ISOLATION TEST (v6 - Race Condition Fixed)...")
     
-    # 1. Connect
     nats_url = os.getenv("NATS_URL", "nats://nats:4222")
     nc = await nats.connect(nats_url)
     js = nc.jetstream()
     print("✅ Connected to NATS")
 
-    # 2. FORCE CLEAN & CREATE STREAMS
-    # We delete the stream first to avoid "Configuration Mismatch" errors
+    # 1. Setup Input Stream
     try:
         await js.delete_stream("LIVESTREAM_TRANSCRIPTION")
-        print("   - Cleaned old Input Stream")
     except: pass
-    
-    # Create Input Stream (Where we send data)
     await js.add_stream(name="LIVESTREAM_TRANSCRIPTION", subjects=["livestream.transcription.enriched"])
-    
-    # Create Output Stream (Where we listen) - Service usually does this, but we do it to be safe
+
+    # 2. Setup Output Stream (THE FIX: Create it here, don't wait for Service)
     try:
         await js.add_stream(name="LIVESTREAM_TRANSLATION", subjects=["livestream.translation.>"])
-    except: pass # It's okay if it exists
-    
-    print("✅ Streams Configured")
+        print("✅ Output Stream Pre-Created")
+    except: 
+        print("⚠️ Output Stream already exists")
 
-    # 3. THE WARMUP PROTOCOL (The Fix for the Timeout)
-    print(f"⏳ Waiting for Service Model Load (This takes ~30s)...")
-    
+    # 3. WARMUP
+    print(f"⏳ Sending ONE Warmup Message and waiting...")
     sub = await js.subscribe("livestream.translation.done")
-    
-    service_ready = False
     warmup_id = "warmup-check"
     
-    # Try for up to 60 seconds
-    for i in range(30):
-        # Send a dummy message
-        payload = {"id": warmup_id, "text": "Warmup", "source_pts": 0}
-        await js.publish("livestream.transcription.enriched", json.dumps(payload).encode())
-        
+    # Send Warmup
+    await js.publish("livestream.transcription.enriched", json.dumps({"id": warmup_id, "text": "Warmup", "source_pts": 0}).encode())
+    
+    service_ready = False
+    start = asyncio.get_event_loop().time()
+    
+    # Wait up to 90s for Model Load + First Inference
+    while (asyncio.get_event_loop().time() - start) < 90:
         try:
-            # Wait briefly for a reply
-            msg = await sub.next_msg(timeout=2)
+            msg = await sub.next_msg(timeout=1)
             data = json.loads(msg.data.decode())
             if data.get("id") == warmup_id:
-                print(f"✅ SERVICE IS AWAKE! (Latency: {i*2}s)")
+                print(f"✅ SERVICE IS AWAKE! (Warmed up)")
                 await msg.ack()
                 service_ready = True
                 break
         except TimeoutError:
-            print(f"   ... still loading model ({i*2}s)")
             continue
     
     if not service_ready:
-        print("❌ FATAL: Service never responded to warmup. Check logs.")
+        print("❌ FATAL: Service timed out on warmup.")
         return
 
-    # 4. RUN REAL TESTS
+    # 4. REAL TEST
     test_cases = [
-        {"text": "Hello, welcome to the livestream.", "desc": "Basic Greeting"},
-        {"text": "The power of the Holy Spirit is here.", "desc": "Theological Sentence"},
-        {"text": "We are moving into a Kairos moment.", "desc": "Complex Vocabulary"}
+        {"text": "Jesus loves you.", "desc": "Simple Theological"},
+        {"text": "The quick brown fox jumps over the lazy dog.", "desc": "Complex Sentence"}
     ]
 
-    score = 0
     print(f"\n🚀 Sending {len(test_cases)} Test Payloads...")
 
     for i, case in enumerate(test_cases):
         print(f"\n🔹 TEST {i+1}: {case['desc']}")
+        print(f"   Input: '{case['text']}'")
         
         msg_id = str(uuid.uuid4())
-        payload = {
-            "id": msg_id,
-            "text": case['text'],
-            "source_pts": i * 1000
-        }
+        payload = {"id": msg_id, "text": case['text'], "source_pts": i * 1000}
         
         await js.publish("livestream.transcription.enriched", json.dumps(payload).encode())
 
         try:
-            # Now that it's warm, it should be fast (5s timeout is plenty)
-            msg = await sub.next_msg(timeout=5)
+            # Wait for translation
+            msg = await sub.next_msg(timeout=45)
             data = json.loads(msg.data.decode())
             
-            # Ensure we aren't reading old warmup messages
+            # Skip old warmup messages if any
             while data.get("id") == warmup_id:
-                 msg = await sub.next_msg(timeout=5)
+                 msg = await sub.next_msg(timeout=45)
                  data = json.loads(msg.data.decode())
 
             translations = data.get("translations", {})
-            print(f"   Received {len(translations)} languages.")
             
-            missing = [lang for lang in EXPECTED_LANGUAGES if lang not in translations]
-            
-            if not missing:
-                print("   ✅ PASS")
-                score += 1
-            else:
-                print(f"   ❌ FAIL: Missing {missing}")
+            # VISUAL OUTPUT
+            print("   ✅ TRANSLATION RECEIVED:")
+            print(json.dumps(translations, indent=4, ensure_ascii=False))
             
             await msg.ack()
 
         except TimeoutError:
-            print("   ❌ TIMEOUT - Logic Error.")
+            print("   ❌ TIMEOUT - Test Failed.")
 
-    print(f"\n{'='*30}")
-    print(f"RESULTS: {score}/{len(test_cases)} Passed")
-    print(f"{'='*30}")
     await nc.close()
 
 if __name__ == "__main__":

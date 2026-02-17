@@ -1,34 +1,34 @@
 version: '3.8'
 
 services:
-  # 1. Message Broker (Ephemeral - No persistence)
+  # 1. Message Broker
   nats:
     image: nats:alpine
-    # -js: Enable JetStream
-    # -m 8222: Monitor port
-    # --store_dir /tmp/nats: Forces ephemeral storage (wiped on restart)
     command: "-js -m 8222 --store_dir /tmp/nats"
     ports: ["4222:4222", "8222:8222"]
 
-  # 2. Translation Service
+  # 2. Translation Service (HOT RELOAD MODE)
   translation:
-    build:
-      context: ./services/translation
-      dockerfile: Dockerfile
+    # 👇 CRITICAL: Use the image you already successfully built. DO NOT REBUILD.
+    image: pentecost-engine-translation:latest
+    # 👇 Map your local code into the container. Changes apply INSTANTLY on restart.
+    volumes:
+      - ./services/translation/src:/app/src
+    command: python -u -m src.main
     environment:
       - TRANS_NATS_URL=nats://nats:4222
       - TRANS_INPUT_SUBJECT=livestream.transcription.enriched
       - TRANS_OUTPUT_SUBJECT_PREFIX=livestream.translation
     depends_on: [nats]
 
-  # 3. Test Driver
+  # 3. Test Driver (Uses the new Dockerfile.tester)
   translation-tester:
-    image: python:3.10-slim
+    build:
+      context: .
+      dockerfile: tests/Dockerfile.tester
+    # Map tests so you can change test cases without rebuilding
     volumes:
       - ./tests:/app/tests
-    working_dir: /app
     environment:
       - NATS_URL=nats://nats:4222
-    command: >
-      sh -c "pip install nats-py && python -u tests/test_translation_independent.py"
     depends_on: [translation]

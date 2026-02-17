@@ -1,0 +1,19 @@
+# Ignore the heavy AI models (The Dockerfile downloads them or we mount them)
+**/model/
+**/voices/
+**/weights/
+
+# Ignore Python clutter
+**/__pycache__
+**/*.pyc
+**/.venv
+**/venv
+**/.env
+
+# Ignore Git history (can be huge)
+.git/
+.gitignore
+
+# Ignore other heavy artifacts
+*.mp4
+*.wav
