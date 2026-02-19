@@ -15,9 +15,9 @@ class Settings(BaseSettings):
     TARGET_LANGUAGES: Dict[str, str] = {
         "spanish": "spa_Latn",
         "french": "fra_Latn",
-        # "swahili": "swh_Latn",  <-- Commented out for speed
-        # "portuguese": "por_Latn",
-        # "german": "deu_Latn"
+        "swahili": "swh_Latn", # <-- Commented out for speed
+        "portuguese": "por_Latn",
+        "german": "deu_Latn"
     }
     
     # Performance

@@ -16,6 +16,8 @@ __pycache__/
 *.py[cod]
 
 **.mp4
+**.wav
+**.h264
 
 #Model weights
 services/asr/adapter

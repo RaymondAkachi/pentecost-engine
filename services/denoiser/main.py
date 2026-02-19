@@ -5,6 +5,7 @@ import nats
 import logging
 import signal
 import ctypes
+from nats.js.errors import NotFoundError
 
 # Logging
 logging.basicConfig(
@@ -19,19 +20,12 @@ OUTPUT_SUBJECT = "livestream.audio.denoised"
 
 # Constants
 SAMPLE_RATE = 48000
-FRAME_SIZE = 480  # RNNoise standard: 480 samples (10ms)
+FRAME_SIZE = 480 
 
 class RNNoiseWrapper:
-    """
-    Direct C-Binding to the RNNoise library.
-    """
     def __init__(self, lib_path="/usr/lib/librnnoise.so"):
         logging.info(f"📚 Loading RNNoise library from {lib_path}...")
-        
-        # 1. Load the Shared Library
         self.lib = ctypes.CDLL(lib_path)
-        
-        # 2. Define C Function Signatures
         self.lib.rnnoise_create.argtypes = [ctypes.c_void_p]
         self.lib.rnnoise_create.restype = ctypes.c_void_p
         self.lib.rnnoise_destroy.argtypes = [ctypes.c_void_p]
@@ -41,25 +35,17 @@ class RNNoiseWrapper:
             ctypes.POINTER(ctypes.c_float)
         ]
         self.lib.rnnoise_process_frame.restype = ctypes.c_float
-        
-        # 3. Initialize State
         self.st = self.lib.rnnoise_create(None)
         if not self.st:
             raise RuntimeError("Failed to create RNNoise state")
         logging.info("✅ RNNoise C-State Initialized")
 
     def process(self, frame_float):
-        # Ensure input is standard C-float array
         in_buffer = frame_float.astype(np.float32)
         out_buffer = np.zeros(FRAME_SIZE, dtype=np.float32)
-        
-        # Get pointers
         in_ptr = in_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
         out_ptr = out_buffer.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
-        
-        # Call C function
         self.lib.rnnoise_process_frame(self.st, out_ptr, in_ptr)
-        
         return out_buffer
 
 class DenoiserService:
@@ -69,32 +55,20 @@ class DenoiserService:
         
     def process_chunk(self, raw_bytes):
         try:
-            # 1. Deserialize
             audio_f32 = np.frombuffer(raw_bytes, dtype=np.float32)
-            
-            # 2. Buffer
             self._buffer = np.concatenate((self._buffer, audio_f32))
-            
             output_frames = []
             
-            # 3. Process 480-sample frames
             while len(self._buffer) >= FRAME_SIZE:
                 frame = self._buffer[:FRAME_SIZE]
                 self._buffer = self._buffer[FRAME_SIZE:]
-                
-                # Scale [-1.0, 1.0] -> [-32768, 32768]
                 frame_scaled = frame * 32768.0
-                
-                # Inference
                 denoised_scaled = self.rnnoise.process(frame_scaled)
-                
-                # Descale
                 denoised_norm = denoised_scaled / 32768.0
                 output_frames.append(denoised_norm)
 
             if not output_frames:
                 return None
-            
             return np.concatenate(output_frames).tobytes()
 
         except Exception as e:
@@ -110,6 +84,8 @@ async def run():
             await asyncio.sleep(1)
     
     js = nc.jetstream()
+    
+    # 1. Create Output Stream (We own this)
     try: await js.add_stream(name="LIVESTREAM_DENOISED", subjects=[OUTPUT_SUBJECT])
     except: pass
     
@@ -121,9 +97,21 @@ async def run():
         if denoised:
             pts = msg.header.get("pts", "0")
             await js.publish(OUTPUT_SUBJECT, denoised, headers={"pts": pts})
-            
-    await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
-    logging.info(f"🎧 Listening on {INPUT_SUBJECT}")
+
+    # 2. PATIENCE LOOP (The Fix)
+    # We must wait for the Ingestion service to create the input stream.
+    logging.info(f"⏳ Waiting for input stream: {INPUT_SUBJECT}...")
+    while True:
+        try:
+            await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
+            logging.info(f"✅ Subscribed to {INPUT_SUBJECT}")
+            break
+        except NotFoundError:
+            logging.warning("   Input stream not ready yet. Retrying in 2s...")
+            await asyncio.sleep(2)
+        except Exception as e:
+            logging.error(f"   Subscription error: {e}")
+            await asyncio.sleep(2)
     
     stop = asyncio.Future()
     loop.add_signal_handler(signal.SIGINT, lambda: stop.set_result(None))

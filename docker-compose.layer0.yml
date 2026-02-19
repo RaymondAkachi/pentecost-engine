@@ -23,7 +23,8 @@ services:
     container_name: pentecost-ingestion
     environment:
       - NATS_URL=nats://nats:4222
-      - INPUT_URL=https://www.youtube.com/watch?v=jfKfPfyJRdk
+      # TEST URL: Sky News Live (24/7 Continuous Speech for ASR Testing)
+      - INPUT_URL=https://www.youtube.com/watch?v=iEpJwprxDdk
     depends_on:
       nats:
         condition: service_healthy
@@ -33,35 +34,62 @@ services:
           memory: 512M
 
   # 3. Denoiser Service
-  denoiser:
-    build:
-      context: ./services/denoiser
-      dockerfile: Dockerfile
-    container_name: pentecost-denoiser
-    environment:
-      - NATS_URL=nats://nats:4222
-    depends_on:
-      nats:
-        condition: service_healthy
-    deploy:
-      resources:
-        limits:
-          cpus: '1.0'
-          memory: 512M
+  # denoiser:
+  #   build:
+  #     context: ./services/denoiser
+  #     dockerfile: Dockerfile
+  #   container_name: pentecost-denoiser
+  #   environment:
+  #     - NATS_URL=nats://nats:4222
+  #   # OPTIMIZATION: Mount code dynamically (No Rebuild Needed)
+  #   volumes:
+  #     - ./services/denoiser:/app
+  #   depends_on:
+  #     nats:
+  #       condition: service_healthy
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         cpus: '1.0'
+  #         memory: 512M
 
-  # 4. Pipeline Validator (Quality Control)
+  # # 4. ASR Service (The One You Changed)
+  # asr:
+  #   build:
+  #     context: ./services/asr
+  #     dockerfile: Dockerfile
+  #   container_name: pentecost-asr
+  #   environment:
+  #     - NATS_URL=nats://nats:4222
+  #     - INPUT_SUBJECT=livestream.audio.denoised
+  #   # OPTIMIZATION: Mount code dynamically (No Rebuild Needed)
+  #   volumes:
+  #     # This maps your local folder to /app inside the container
+  #     - ./services/asr:/app
+  #     # Keep the model folder internal so we don't re-download it
+  #     - /app/models
+  #   depends_on:
+  #     denoiser:
+  #       condition: service_started
+  #   deploy:
+  #     resources:
+  #       limits:
+  #         memory: 4G
+
+  # 5. Pipeline Validator
   validator:
-    image: python:3.10-slim
+    build: 
+      context: ./services/validator
+      dockerfile: Dockerfile
     container_name: pentecost-validator
-    working_dir: /app
-    # Fix: Ensure dependencies are installed before running
-    command: >
-      sh -c "pip install nats-py numpy && python -u validator.py"
-    volumes:
-      # Mount the local validator.py into the container
-      - ./validator.py:/app/validator.py
     environment:
       - NATS_URL=nats://nats:4222
+    # Mount script for easy editing, but deps are now baked in
+    volumes:
+      - ./validator.py:/app/validator.py
     depends_on:
-      denoiser:
+      ingestion:
         condition: service_started
+    # depends_on:
+      # asr:
+      #   condition: service_started

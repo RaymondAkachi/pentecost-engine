@@ -1,153 +1,140 @@
 import asyncio
 import os
-import torch
+import signal
+import time
 import numpy as np
-import json
 import nats
 import logging
-import torchaudio
-from transformers import WhisperProcessor, WhisperForConditionalGeneration, BitsAndBytesConfig
-from peft import PeftModel
+# REMOVED: from scipy import signal as scipy_signal (No longer needed)
+from faster_whisper import WhisperModel
 
-# --- CONFIGURATION ---
-NATS_URL = os.getenv("NATS_URL", "nats://localhost:4222")
-INPUT_SUBJECT = "livestream.audio.denoised"   # From Denoiser (Layer 0)
-OUTPUT_SUBJECT = "livestream.transcription.raw" # To RAG (Layer 1.5)
-MODEL_NAME = "openai/whisper-large-v3"
-ADAPTER_PATH = "/app/adapter" # Path inside Docker container
+# Logging
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger("ASR")
 
-# --- LOGGING ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("PentecostASR")
+# Configuration
+NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
+# Default to Raw Audio since we are bypassing Denoiser for CPU tests
+INPUT_SUBJECT = os.getenv("INPUT_SUBJECT", "livestream.audio.raw")
+OUTPUT_SUBJECT = os.getenv("OUTPUT_SUBJECT", "livestream.transcription.raw")
 
-class PropheticASR:
+# Model Settings
+MODEL_SIZE = os.getenv("MODEL_SIZE", "tiny") 
+COMPUTE_TYPE = os.getenv("COMPUTE_TYPE", "int8") 
+DEVICE = os.getenv("DEVICE", "cpu") 
+
+class ASREngine:
     def __init__(self):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"🚀 Initializing ASR on {self.device.upper()}...")
+        logger.info(f"🧠 Loading Whisper ({MODEL_SIZE}) on {DEVICE}...")
+        self.model = WhisperModel(
+            MODEL_SIZE, 
+            device=DEVICE, 
+            compute_type=COMPUTE_TYPE,
+            cpu_threads=4 
+        )
+        logger.info("✅ Model Loaded & Ready.")
 
-        # 1. Load Tokenizer & Processor
-        self.processor = WhisperProcessor.from_pretrained(MODEL_NAME)
+    def transcribe(self, audio_np):
+        start_time = time.time()
+        
+        # Run Inference
+        segments, info = self.model.transcribe(
+            audio_np, 
+            beam_size=5, 
+            language="en", 
+            condition_on_previous_text=False,
+            vad_filter=True,
+            vad_parameters=dict(min_silence_duration_ms=200) 
+        )
+        
+        # Force generator to run immediately
+        segment_list = list(segments)
+        text = " ".join([s.text for s in segment_list]).strip()
+        
+        duration = time.time() - start_time
+        if text:
+            logger.info(f"⚡ Inference took {duration:.2f}s | VAD Audio Retained: {info.duration_after_vad:.2f}s")
+        
+        return text
 
-        # 2. Load Base Model (Dynamic Quantization)
-        if self.device == "cuda":
-            logger.info("⚡ GPU Detected: Loading in 4-bit (High Efficiency)...")
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
-                bnb_4bit_use_double_quant=True,
-            )
-            base_model = WhisperForConditionalGeneration.from_pretrained(
-                MODEL_NAME, 
-                quantization_config=bnb_config, 
-                device_map="auto"
-            )
-        else:
-            logger.warning("⚠️ CPU Detected: Loading in Full Precision (Slower)...")
-            base_model = WhisperForConditionalGeneration.from_pretrained(MODEL_NAME)
-            base_model.to(self.device)
+class ASRService:
+    def __init__(self):
+        self.engine = ASREngine()
+        # REMOVED: self.resampler = AudioResampler(48000, 16000)
+        
+        self.buffer = np.array([], dtype=np.float32)
+        self.buffer_limit = 16000 * 5 # 5 Seconds @ 16kHz
+        self.chunk_count = 0
 
-        # 3. Load Your Custom "Pentecost" Adapter
-        logger.info(f"🧠 Loading Prophetic Adapter from {ADAPTER_PATH}...")
+    def process_packet(self, raw_bytes, pts):
+        # 1. Deserialize (Input is ALREADY 16kHz Float32 from Ingestion)
+        chunk_16k = np.frombuffer(raw_bytes, dtype=np.float32)
+        
+        # 2. Append directly
+        self.buffer = np.concatenate((self.buffer, chunk_16k))
+        self.chunk_count += 1
+        
+        # Log every 100 chunks so we know it's alive (reduced spam)
+        if self.chunk_count % 100 == 0:
+            fill_pct = (len(self.buffer) / self.buffer_limit) * 100
+            logger.info(f"🌊 Buffer Filling: {fill_pct:.1f}% ({len(self.buffer)/16000:.1f}s)")
+
+        # 3. Process if Full
+        if len(self.buffer) >= self.buffer_limit:
+            # Transcribe
+            text = self.engine.transcribe(self.buffer)
+            
+            # Reset
+            self.buffer = np.array([], dtype=np.float32)
+            
+            if text:
+                logger.info(f"📝 DETECTED: \"{text}\"")
+                return text
+            # REMOVED: Silence warning to keep logs clean for pipeline view
+                
+        return None
+
+async def run():
+    nc = None
+    while nc is None:
         try:
-            self.model = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
-            self.model.eval()
-            logger.info("✅ Adapter Loaded Successfully.")
-        except Exception as e:
-            logger.critical(f"❌ Failed to load adapter: {e}")
-            raise e
-
-        # 4. Resampler (48kHz Denoiser -> 16kHz Whisper)
-        self.resampler = torchaudio.transforms.Resample(orig_freq=48000, new_freq=16000).to(self.device)
-
-    def transcribe(self, audio_bytes):
-        """
-        Takes raw 48kHz PCM bytes, resamples, and transcribes.
-        """
-        try:
-            # A. Bytes -> Tensor
-            # Denoiser sends float32 chunks at 48kHz
-            audio_tensor = torch.from_numpy(
-                np.frombuffer(audio_bytes, dtype=np.float32)
-            ).to(self.device)
-
-            # B. Resample (48k -> 16k)
-            # Whisper requires 16000Hz audio
-            audio_16k = self.resampler(audio_tensor)
-
-            # C. Preprocess Input
-            input_features = self.processor(
-                audio_16k.cpu().numpy(), # Move to CPU for processor
-                sampling_rate=16000, 
-                return_tensors="pt"
-            ).input_features.to(self.device)
-
-            # Cast to fp16 if on GPU
-            if self.device == "cuda":
-                input_features = input_features.to(torch.float16)
-
-            # D. Generate Text
-            with torch.no_grad():
-                predicted_ids = self.model.generate(
-                    input_features,
-                    language="en",
-                    max_new_tokens=128 # Limit latency
-                )
-
-            # E. Decode
-            transcription = self.processor.batch_decode(predicted_ids, skip_special_tokens=True)[0]
-            return transcription.strip()
-
-        except Exception as e:
-            logger.error(f"Inference Error: {e}")
-            return ""
-
-async def run_service():
-    logger.info("🔌 Connecting to NATS...")
-    nc = await nats.connect(NATS_URL)
+            nc = await nats.connect(NATS_URL)
+            logger.info("✅ Connected to NATS")
+        except:
+            logger.warning("⏳ Waiting for NATS...")
+            await asyncio.sleep(1)
+            
     js = nc.jetstream()
     
-    # Initialize Engine
-    asr_engine = PropheticASR()
-
-    # Semaphore to prevent GPU overload (process 1 chunk at a time)
-    sem = asyncio.Semaphore(1)
-
-    async def msg_handler(msg):
-        async with sem:
-            try:
-                # 1. Transcribe (Blocking CPU/GPU operation in executor)
-                loop = asyncio.get_running_loop()
-                text = await loop.run_in_executor(None, asr_engine.transcribe, msg.data)
-                
-                # 2. Publish if we heard something
-                if len(text) > 0:
-                    logger.info(f"🗣️  ASR: {text}")
-                    
-                    payload = {
-                        "text": text,
-                        "source_pts": msg.headers.get("PTS", "0"),
-                        "confidence": 0.99, # High trust in fine-tune
-                        "model": "Pentecost-v1"
-                    }
-                    
-                    await js.publish(
-                        OUTPUT_SUBJECT, 
-                        json.dumps(payload).encode(),
-                        headers=msg.headers
-                    )
-            except Exception as e:
-                logger.error(f"Handler Error: {e}")
-
-    # Subscribe
-    await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
-    logger.info(f"👂 Listening on {INPUT_SUBJECT}")
+    # Ensure Output Stream exists
+    try: 
+        await js.add_stream(name="LIVESTREAM_TRANSCRIPTION", subjects=[OUTPUT_SUBJECT, "livestream.transcription.enriched"])
+    except: pass
     
-    # Keep alive
-    try:
-        await asyncio.Future()
-    except KeyboardInterrupt:
-        await nc.close()
+    service = ASRService()
+    loop = asyncio.get_running_loop()
+    
+    async def msg_handler(msg):
+        pts = msg.header.get("pts", "0")
+        # Run blocking AI task in thread
+        text = await loop.run_in_executor(None, service.process_packet, msg.data, pts)
+        
+        if text:
+            # Publish RAW transcription
+            payload = f'{{"text": "{text}", "source_pts": "{pts}"}}'
+            await js.publish(OUTPUT_SUBJECT, payload.encode("utf-8"), headers={"pts": pts})
+            
+    await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
+    logger.info(f"🎧 Listening on {INPUT_SUBJECT}")
+    
+    stop = asyncio.Future()
+    loop.add_signal_handler(signal.SIGINT, lambda: stop.set_result(None))
+    await stop
+    await nc.close()
 
 if __name__ == "__main__":
-    asyncio.run(run_service())
+    asyncio.run(run())

@@ -19,14 +19,20 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// --- CONFIGURATION (Pentecost v2.0) ---
+// --- CONFIGURATION (Pentecost v2.1 - Fixed Audio) ---
 const (
 	NatsURL        = "nats://nats:4222"
 	VideoSubject   = "livestream.video.raw"
 	AudioSubject   = "livestream.audio.raw"
 	VideoPort      = ":4000"
 	AudioPort      = ":4001"
-	BufferDuration = 60 * time.Second // The "Pentecost Buffer"
+	BufferDuration = 60 * time.Second
+
+	// AUDIO CONSTANTS (Crucial for Sync)
+	SampleRate   = 16000
+	Channels     = 1
+	BytesPerSamp = 4    // Float32 = 4 bytes
+	AudioChunkSz = 4096 // 4KB chunks = ~64ms of audio
 )
 
 // --- PENTECOST BUFFER IMPLEMENTATION ---
@@ -46,19 +52,17 @@ type PentecostBuffer struct {
 func NewPentecostBuffer(duration time.Duration) *PentecostBuffer {
 	return &PentecostBuffer{
 		duration: duration,
-		segments: make([]*StreamSegment, 0, 1000),
+		segments: make([]*StreamSegment, 0, 5000),
 	}
 }
 
 func (pb *PentecostBuffer) Add(seg *StreamSegment) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-
 	pb.segments = append(pb.segments, seg)
-
-	// Safety: Prevent OOM if consumer dies
-	if len(pb.segments) > 3000 {
-		pb.segments = pb.segments[1:] // Drop oldest
+	// Safety cap to prevent memory leaks
+	if len(pb.segments) > 10000 {
+		pb.segments = pb.segments[1:]
 	}
 }
 
@@ -95,14 +99,11 @@ type IngestionService struct {
 }
 
 func main() {
-	if len(os.Args) > 1 && strings.HasPrefix(os.Args[1], "-test") {
-		return
-	}
 	RunService()
 }
 
 func RunService() {
-	log.Println("🚀 Starting Pentecost Ingestion Service v2.0")
+	log.Println("🚀 Starting Pentecost Ingestion Service v2.1 (Audio Fix)")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -119,7 +120,11 @@ func RunService() {
 	var nc *nats.Conn
 	var err error
 	for i := 0; i < 10; i++ {
-		nc, err = nats.Connect(os.Getenv("NATS_URL"), nats.Name("Pentecost-Ingest"))
+		url := os.Getenv("NATS_URL")
+		if url == "" {
+			url = NatsURL
+		}
+		nc, err = nats.Connect(url, nats.Name("Pentecost-Ingest"))
 		if err == nil {
 			break
 		}
@@ -136,8 +141,7 @@ func RunService() {
 		log.Fatal("❌ JetStream Init Failed:", err)
 	}
 
-	createStream(js, "LIVESTREAM_VIDEO", VideoSubject)
-	createStream(js, "LIVESTREAM_AUDIO", AudioSubject)
+	createStream(js, "LIVESTREAM_RAW", []string{VideoSubject, AudioSubject})
 
 	svc := &IngestionService{
 		nc:          nc,
@@ -148,13 +152,13 @@ func RunService() {
 	}
 
 	if svc.inputURL == "" {
-		svc.inputURL = "https://www.youtube.com/watch?v=jfKfPfyJRdk"
+		svc.inputURL = "https://www.youtube.com/watch?v=jL8uDJJBjMA" // Al Jazeera default
 	}
 
-	// 3. Start Broadcaster
+	// 2. Start Broadcaster
 	go svc.startBroadcaster(ctx)
 
-	// 4. Start Ingestion
+	// 3. Start TCP Listeners for FFmpeg
 	var wg sync.WaitGroup
 	videoReady := make(chan struct{})
 	audioReady := make(chan struct{})
@@ -168,7 +172,7 @@ func RunService() {
 	<-audioReady
 	log.Println("✅ TCP Listeners Active")
 
-	// 5. Run FFmpeg Loop
+	// 4. Run FFmpeg Loop
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -179,11 +183,10 @@ func RunService() {
 }
 
 func (s *IngestionService) startBroadcaster(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond)
+	ticker := time.NewTicker(50 * time.Millisecond) // Fast tick for smooth playback
 	defer ticker.Stop()
 
 	log.Printf("⏳ Pentecost Buffer Active: Holding streams for %v...", BufferDuration)
-
 	hasBroadcast := false
 
 	for {
@@ -191,6 +194,7 @@ func (s *IngestionService) startBroadcaster(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 1. Process Video
 			readyVideo := s.videoBuffer.PopReady()
 			for _, seg := range readyVideo {
 				msg := &nats.Msg{
@@ -199,18 +203,10 @@ func (s *IngestionService) startBroadcaster(ctx context.Context) {
 					Header:  nats.Header{},
 				}
 				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
-				msg.Header.Add("keyframe", fmt.Sprintf("%t", seg.IsKeyframe))
 				s.js.PublishMsgAsync(msg)
 			}
 
-			// Only log sparsely to avoid spam
-			if len(readyVideo) > 0 {
-				if !hasBroadcast {
-					log.Println("📡 BROADCAST LIVE: First frames released from buffer!")
-					hasBroadcast = true
-				}
-			}
-
+			// 2. Process Audio
 			readyAudio := s.audioBuffer.PopReady()
 			for _, seg := range readyAudio {
 				msg := &nats.Msg{
@@ -220,6 +216,19 @@ func (s *IngestionService) startBroadcaster(ctx context.Context) {
 				}
 				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
 				s.js.PublishMsgAsync(msg)
+			}
+
+			// Flush Async Buffer
+			select {
+			case <-s.js.PublishAsyncComplete():
+			default:
+			}
+
+			if len(readyVideo) > 0 || len(readyAudio) > 0 {
+				if !hasBroadcast {
+					log.Println("📡 BROADCAST LIVE: First frames released from buffer!")
+					hasBroadcast = true
+				}
 			}
 		}
 	}
@@ -232,10 +241,12 @@ func (s *IngestionService) runFFmpegLoop(ctx context.Context) {
 			return
 		default:
 			streamURL := s.inputURL
+
+			// Resolve YouTube URL
 			if strings.Contains(s.inputURL, "youtube.com") || strings.Contains(s.inputURL, "youtu.be") {
 				log.Println("🔍 Resolving YouTube URL with yt-dlp...")
-				// Force HLS to handle live streams better
-				cmd := exec.CommandContext(ctx, "yt-dlp", "-f", "best[height<=720]", "-g", s.inputURL)
+				// Force HLS (m3u8) for better stability
+				cmd := exec.CommandContext(ctx, "yt-dlp", "-f", "95/94/93/best", "-g", s.inputURL)
 				out, err := cmd.Output()
 				if err != nil {
 					log.Printf("❌ yt-dlp failed: %v. Retrying in 5s...", err)
@@ -248,20 +259,36 @@ func (s *IngestionService) runFFmpegLoop(ctx context.Context) {
 
 			log.Println("🎬 Starting FFmpeg Ingestion...")
 
+			// CRITICAL FFMPEG ARGS FOR SYNC & AUDIO QUALITY
 			args := []string{
-				"-loglevel", "error", // FIX: Silence the "Skip AD" spam
-				"-re",
+				"-hide_banner", "-loglevel", "error",
+				"-re", // Read input at native frame rate
 				"-i", streamURL,
-				"-map", "0:v", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb", "-f", "h264", "tcp://127.0.0.1:4000",
-				"-map", "0:a", "-c:a", "pcm_f32le", "-ar", "16000", "-ac", "1", "-f", "f32le", "tcp://127.0.0.1:4001",
+
+				// VIDEO: Copy H.264 stream directly to TCP 4000
+				"-map", "0:v",
+				"-c:v", "copy",
+				"-bsf:v", "h264_mp4toannexb", // Essential for raw H.264 stream
+				"-f", "h264",
+				"tcp://127.0.0.1:4000",
+
+				// AUDIO: Transcode to PCM Float32LE @ 16000Hz Mono
+				"-map", "0:a",
+				"-c:a", "pcm_f32le",
+				"-ar", "16000", // FORCE 16k
+				"-ac", "1", // FORCE Mono
+				"-f", "f32le", // Raw float32 stream
+				"tcp://127.0.0.1:4001",
 			}
 
 			cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-			cmd.Stderr = os.Stderr
+			cmd.Stderr = os.Stderr // Pipe FFmpeg errors to Docker logs
+
 			if err := cmd.Run(); err != nil {
 				log.Printf("⚠️ FFmpeg exited: %v", err)
 			}
 
+			// If FFmpeg dies, wait before restarting
 			time.Sleep(2 * time.Second)
 		}
 	}
@@ -284,24 +311,41 @@ func (s *IngestionService) startVideoServer(ctx context.Context, ready chan<- st
 	}
 }
 
+// Split H.264 stream into NAL units
 func (s *IngestionService) handleVideo(conn net.Conn) {
 	defer conn.Close()
-	log.Println("🔌 Video Stream Connected! (Buffering starts now)") // FIX: Immediate Feedback
+	log.Println("🔌 Video Stream Connected!")
 
+	// 10MB Buffer for HD frames
 	scanner := bufio.NewScanner(conn)
 	buf := make([]byte, 10*1024*1024)
 	scanner.Buffer(buf, 10*1024*1024)
 
+	// Custom Split function for H.264 NAL start codes (00 00 00 01)
 	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
+		if atEOF && len(data) == 0 {
+			return 0, nil, nil
+		}
+
+		// Find NAL start code
 		delimiter := []byte{0, 0, 0, 1}
 		if i := bytes.Index(data, delimiter); i >= 0 {
-			if i > 0 {
-				return i, data[:i], nil
+			// Found start code
+			if i == 0 {
+				// We are at the start, find NEXT start code
+				if j := bytes.Index(data[4:], delimiter); j >= 0 {
+					return j + 4, data[:j+4], nil
+				}
+				// Need more data to find end of frame
+				if atEOF {
+					return len(data), data, nil
+				}
+				return 0, nil, nil
 			}
-			if j := bytes.Index(data[4:], delimiter); j >= 0 {
-				return j + 4, data[:j+4], nil
-			}
+			// We found a start code later in buffer, return up to it
+			return i, data[:i], nil
 		}
+
 		if atEOF {
 			return len(data), data, nil
 		}
@@ -311,13 +355,14 @@ func (s *IngestionService) handleVideo(conn net.Conn) {
 	start := time.Now()
 	for scanner.Scan() {
 		frame := make([]byte, len(scanner.Bytes()))
-		copy(frame, scanner.Bytes())
+		copy(frame, scanner.Bytes()) // Copy strictly
 
-		pts := time.Since(start).Milliseconds()
+		pts := time.Since(start).Milliseconds() * 90 // 90kHz clock for consistency
+
 		isKey := false
 		if len(frame) > 4 {
-			nal := frame[4] & 0x1F
-			if nal == 5 || nal == 7 || nal == 8 {
+			nalType := frame[4] & 0x1F
+			if nalType == 5 || nalType == 7 || nalType == 8 {
 				isKey = true
 			}
 		}
@@ -350,26 +395,33 @@ func (s *IngestionService) startAudioServer(ctx context.Context, ready chan<- st
 
 func (s *IngestionService) handleAudio(conn net.Conn) {
 	defer conn.Close()
-	log.Println("🔌 Audio Stream Connected!") // FIX: Immediate Feedback
+	log.Println("🔌 Audio Stream Connected!")
 
-	// 16kHz * 1ch * 4bytes = 64000 bytes/sec
-	// 0.1s chunk = 6400 bytes
-	const ChunkSize = 6400
-	buf := make([]byte, ChunkSize)
-	var totalBytes int64 = 0
+	// Chunk Size: 4096 bytes (1024 samples @ Float32)
+	// At 16000Hz, 1024 samples = 64ms duration
+	buf := make([]byte, AudioChunkSz)
+	var totalSamples int64 = 0
 
 	for {
-		n, err := io.ReadFull(conn, buf) // FIX: Use ReadFull
+		// ReadFull ensures we get a complete chunk.
+		// Previous code used Read() which returns partial chunks -> SPEEDUP BUG
+		n, err := io.ReadFull(conn, buf)
 		if err != nil {
+			if err != io.EOF {
+				log.Printf("Audio read error: %v", err)
+			}
 			return
 		}
 
 		dataCopy := make([]byte, n)
 		copy(dataCopy, buf[:n])
 
-		// Correct PTS calculation
-		pts := (totalBytes * 1000) / (16000 * 4 * 1)
-		totalBytes += int64(n)
+		// Calculate PTS based on sample count
+		// PTS = (TotalSamples / SampleRate) * 1000ms
+		// We use simple sample counting for exact sync
+
+		pts := (totalSamples * 1000) / int64(SampleRate)
+		totalSamples += int64(n / BytesPerSamp)
 
 		s.audioBuffer.Add(&StreamSegment{
 			Data:      dataCopy,
@@ -379,14 +431,19 @@ func (s *IngestionService) handleAudio(conn net.Conn) {
 	}
 }
 
-func createStream(js nats.JetStreamContext, name, subject string) {
+func createStream(js nats.JetStreamContext, name string, subjects []string) {
 	_, err := js.StreamInfo(name)
 	if err != nil {
-		js.AddStream(&nats.StreamConfig{
-			Name:     name,
-			Subjects: []string{subject},
-			MaxAge:   5 * time.Minute,
-			Storage:  nats.MemoryStorage,
+		log.Printf("Creating Stream: %s", name)
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name:      name,
+			Subjects:  subjects,
+			MaxAge:    5 * time.Minute,
+			Storage:   nats.MemoryStorage,
+			Retention: nats.LimitsPolicy,
 		})
+		if err != nil {
+			log.Printf("⚠️ Stream Create Warn: %v", err)
+		}
 	}
 }
