@@ -23,7 +23,7 @@ services:
     build: ./services/ingestion
     environment:
       - NATS_URL=nats://nats:4222
-      - INPUT_URL=https://www.youtube.com/watch?v=Ap-UM1O9RBU
+      - INPUT_URL=https://www.youtube.com/watch?v=ijcfMijOgao # Not permanent live church broadcast, just for testing
     depends_on: [init-infra]
 
   # --- LAYER 1: ASR ---
@@ -51,11 +51,8 @@ services:
 
   # --- LAYER 1.5: TRANSLATION ---
   translation:
-    # TRY TO USE LOCAL IMAGE FIRST, FALLBACK TO BUILD
     image: pentecost-engine-translation:latest
-    build: 
-      context: .
-      dockerfile: services/translation/Dockerfile 
+    build: ./services/translation
     volumes:
       - ./services/translation/src:/app/src
     command: python -u -m src.main

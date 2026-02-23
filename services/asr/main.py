@@ -2,10 +2,11 @@ import asyncio
 import os
 import signal
 import time
+import json
+import base64
 import numpy as np
 import nats
 import logging
-# REMOVED: from scipy import signal as scipy_signal (No longer needed)
 from faster_whisper import WhisperModel
 
 # Logging
@@ -18,7 +19,6 @@ logger = logging.getLogger("ASR")
 
 # Configuration
 NATS_URL = os.getenv("NATS_URL", "nats://nats:4222")
-# Default to Raw Audio since we are bypassing Denoiser for CPU tests
 INPUT_SUBJECT = os.getenv("INPUT_SUBJECT", "livestream.audio.raw")
 OUTPUT_SUBJECT = os.getenv("OUTPUT_SUBJECT", "livestream.transcription.raw")
 
@@ -51,7 +51,6 @@ class ASREngine:
             vad_parameters=dict(min_silence_duration_ms=200) 
         )
         
-        # Force generator to run immediately
         segment_list = list(segments)
         text = " ".join([s.text for s in segment_list]).strip()
         
@@ -64,37 +63,26 @@ class ASREngine:
 class ASRService:
     def __init__(self):
         self.engine = ASREngine()
-        # REMOVED: self.resampler = AudioResampler(48000, 16000)
-        
         self.buffer = np.array([], dtype=np.float32)
         self.buffer_limit = 16000 * 5 # 5 Seconds @ 16kHz
         self.chunk_count = 0
 
-    def process_packet(self, raw_bytes, pts):
-        # 1. Deserialize (Input is ALREADY 16kHz Float32 from Ingestion)
-        chunk_16k = np.frombuffer(raw_bytes, dtype=np.float32)
-        
-        # 2. Append directly
+    # FIX: Now accepts a decoded numpy array directly
+    def process_packet(self, chunk_16k: np.ndarray, pts: int):
         self.buffer = np.concatenate((self.buffer, chunk_16k))
         self.chunk_count += 1
         
-        # Log every 100 chunks so we know it's alive (reduced spam)
         if self.chunk_count % 100 == 0:
             fill_pct = (len(self.buffer) / self.buffer_limit) * 100
             logger.info(f"🌊 Buffer Filling: {fill_pct:.1f}% ({len(self.buffer)/16000:.1f}s)")
 
-        # 3. Process if Full
         if len(self.buffer) >= self.buffer_limit:
-            # Transcribe
             text = self.engine.transcribe(self.buffer)
-            
-            # Reset
             self.buffer = np.array([], dtype=np.float32)
             
             if text:
                 logger.info(f"📝 DETECTED: \"{text}\"")
                 return text
-            # REMOVED: Silence warning to keep logs clean for pipeline view
                 
         return None
 
@@ -106,11 +94,10 @@ async def run():
             logger.info("✅ Connected to NATS")
         except:
             logger.warning("⏳ Waiting for NATS...")
-            await asyncio.sleep(1)
+            await asyncio.sleep(2)
             
     js = nc.jetstream()
     
-    # Ensure Output Stream exists
     try: 
         await js.add_stream(name="LIVESTREAM_TRANSCRIPTION", subjects=[OUTPUT_SUBJECT, "livestream.transcription.enriched"])
     except: pass
@@ -119,14 +106,41 @@ async def run():
     loop = asyncio.get_running_loop()
     
     async def msg_handler(msg):
-        pts = msg.header.get("pts", "0")
-        # Run blocking AI task in thread
-        text = await loop.run_in_executor(None, service.process_packet, msg.data, pts)
-        
-        if text:
-            # Publish RAW transcription
-            payload = f'{{"text": "{text}", "source_pts": "{pts}"}}'
-            await js.publish(OUTPUT_SUBJECT, payload.encode("utf-8"), headers={"pts": pts})
+        try:
+            # FIX: Parse JSON payload from Go Engine
+            payload = json.loads(msg.data.decode('utf-8'))
+            
+            # Defensive check: Ensure it's an audio chunk
+            chunk_id = payload.get("chunk_id", "")
+            if not chunk_id.startswith("a_"):
+                return
+
+            pts = payload.get("pts", 0)
+            audio_b64 = payload.get("data", "")
+            
+            if not audio_b64:
+                return
+
+            # FIX: Decode Base64 to raw bytes, then to numpy float32
+            raw_bytes = base64.b64decode(audio_b64)
+            audio_np = np.frombuffer(raw_bytes, dtype=np.float32)
+
+            # Run blocking AI task in thread
+            text = await loop.run_in_executor(None, service.process_packet, audio_np, pts)
+            
+            if text:
+                # FIX: Safe JSON serialization to prevent quote-breaking
+                out_payload = json.dumps({
+                    "text": text, 
+                    "source_pts": pts
+                })
+                await js.publish(OUTPUT_SUBJECT, out_payload.encode("utf-8"), headers={"pts": str(pts)})
+
+        except Exception as e:
+            logger.error(f"❌ Processing Error: {str(e)}")
+        finally:
+            # FIX: Acknowledge message to prevent infinite JetStream loops
+            await msg.ack()
             
     await js.subscribe(INPUT_SUBJECT, cb=msg_handler)
     logger.info(f"🎧 Listening on {INPUT_SUBJECT}")

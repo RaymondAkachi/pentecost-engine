@@ -36,3 +36,8 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
+
+[tool.uv.workspace]
+members = [
+    "services/face_detection",
+]

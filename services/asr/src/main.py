@@ -5,11 +5,9 @@ import base64
 import structlog
 import nats
 import numpy as np
-import time
 from concurrent.futures import ThreadPoolExecutor
 from .config import settings
 from .engine import ASREngine
-from .models import AudioChunk
 
 # Logging Setup
 structlog.configure(
@@ -26,7 +24,6 @@ async def run():
     log.info("startup", config=settings.model_dump())
 
     # 1. Initialize Engine (Heavy Load)
-    # We use a ThreadPool to keep the main loop free for NATS
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         engine = ASREngine()
@@ -51,15 +48,15 @@ async def run():
     # 3. Message Handler
     async def msg_handler(msg):
         try:
-            # Decode Payload
+            # 1. Decode the JSON payload first
             data = json.loads(msg.data.decode())
             
-            # Decode Audio (Base64 -> Float32)
-            # We assume input is Float32 PCM encoded as Base64
+            # 2. Extract pts safely from the JSON dictionary
+            pts = data.get('pts', 0)
+            
+            # 3. Extract and decode the audio
             audio_bytes = base64.b64decode(data['data'])
             audio_np = np.frombuffer(audio_bytes, dtype=np.float32)
-            
-            pts = data.get('timestamp', 0)
             
             # Offload Inference to Thread
             loop = asyncio.get_running_loop()
@@ -70,20 +67,19 @@ async def run():
                 pts
             )
             
-            # Publish Results (if any)
+            # Publish Results
             for res in results:
                 await js.publish(
                     settings.OUTPUT_SUBJECT,
                     res.model_dump_json().encode()
                 )
-                log.info("published_transcription", text=res.text[:20])
+                log.info("published_transcription", text=res.text[:30], pts=res.source_pts)
             
             await msg.ack()
 
         except Exception as e:
             log.error("processing_error", error=str(e))
-            # Don't nak immediately to avoid loop storm on bad data
-            await msg.ack() 
+            await msg.ack()
 
     # 4. Subscribe
     await js.subscribe(

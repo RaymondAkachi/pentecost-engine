@@ -1,12 +1,11 @@
 from pydantic import BaseModel
-from typing import Optional, List
 
 class AudioChunk(BaseModel):
-    """Incoming raw audio from Denoiser/Ingestion"""
-    stream_id: str
-    timestamp: float
-    data: str  # Base64 encoded PCM float32
-    sample_rate: int
+    """Incoming raw audio from Go Ingestion Engine"""
+    chunk_id: str
+    pts: int       # Changed from timestamp
+    duration: float
+    data: str      # Base64 encoded PCM float32
 
 class TranscriptionResult(BaseModel):
     """Outgoing text to RAG Layer"""
