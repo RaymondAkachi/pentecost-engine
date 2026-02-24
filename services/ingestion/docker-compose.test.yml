@@ -14,13 +14,38 @@ services:
       timeout: 2s
       retries: 5
 
-  ingestion-test:
+  ingestion:
     build:
       context: .
-      dockerfile: Dockerfile.test
+      dockerfile: Dockerfile  # Using your original production Dockerfile
+    container_name: pentecost-ingestion
     environment:
       - NATS_URL=nats://nats:4222
-      # Use a 24/7 stream to guarantee data
-      - INPUT_URL=https://www.youtube.com/watch?v=jfKfPfyJRdk
+      - INPUT_URL=https://www.youtube.com/watch?v=YDvsBbKfLPA
+    volumes:
+      # Removed .:/app to prevent overwriting the compiled binary
+      - shared_chunks:/shared/chunks
     depends_on:
       - nats
+
+  validator:
+    build:
+      context: .
+      dockerfile: Dockerfile.validator
+    container_name: pentecost-validator
+    environment:
+      - NATS_URL=nats://nats:4222
+    volumes:
+      # Removed .:/app to prevent overwriting the Python script
+      - shared_chunks:/shared/chunks
+    depends_on:
+      - nats
+      - ingestion
+
+volumes:
+  shared_chunks:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1G,uid=1000

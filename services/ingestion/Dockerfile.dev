@@ -1,0 +1,24 @@
+# Dockerfile.dev
+FROM golang:1.23-alpine
+
+# Install FFmpeg, Python (for yt-dlp), and Dev Tools
+RUN apk update && apk add --no-cache \
+    ffmpeg \
+    python3 \
+    curl \
+    ca-certificates \
+    bash \
+    git
+
+# Install yt-dlp
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
+    chmod a+rx /usr/local/bin/yt-dlp
+
+WORKDIR /app
+
+# Install 'air' for live hot-reloading
+RUN go install github.com/air-verse/air@latest
+
+# We don't COPY code here; docker-compose will bind-mount it.
+# The container will start by running 'air' to watch for file changes.
+CMD ["air", "-c", ".air.toml"]

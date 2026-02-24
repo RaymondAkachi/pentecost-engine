@@ -1,0 +1,14 @@
+FROM python:3.10-slim
+
+# Install ffmpeg for ffprobe video validation
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install the async Python NATS client
+RUN pip install nats-py
+
+# Copy the validation script into the image
+COPY validator.py .
+
+CMD ["python", "-u", "validator.py"]

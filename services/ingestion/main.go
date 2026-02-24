@@ -1,9 +1,10 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -19,91 +21,112 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// --- CONFIGURATION (Pentecost v2.1 - Fixed Audio) ---
+// --- CONFIGURATION ---
 const (
-	NatsURL        = "nats://nats:4222"
-	VideoSubject   = "livestream.video.raw"
-	AudioSubject   = "livestream.audio.raw"
-	VideoPort      = ":4000"
-	AudioPort      = ":4001"
-	BufferDuration = 60 * time.Second
+	NatsURL         = "nats://nats:4222"
+	VideoSubject    = "livestream.video.raw"
+	AudioSubject    = "livestream.audio.raw"
+	AudioPort       = ":4001"
+	SharedChunkPath = "/shared/chunks"
 
-	// AUDIO CONSTANTS (Crucial for Sync)
-	SampleRate   = 16000
-	Channels     = 1
-	BytesPerSamp = 4    // Float32 = 4 bytes
-	AudioChunkSz = 4096 // 4KB chunks = ~64ms of audio
+	SampleRate     = 16000
+	Channels       = 1
+	BytesPerSamp   = 4
+	BatchDuration  = 5
+	AudioBatchSize = SampleRate * Channels * BytesPerSamp * BatchDuration
+	BufferDelay    = 60 * time.Second
 )
 
-// --- PENTECOST BUFFER IMPLEMENTATION ---
-type StreamSegment struct {
-	Data       []byte
-	Timestamp  time.Time
-	IsKeyframe bool
-	PTS        int64
+type ChunkPayload struct {
+	ChunkID      string  `json:"chunk_id"`
+	PTS          int64   `json:"pts"`
+	Duration     float64 `json:"duration"`
+	FilePath     string  `json:"file_path"`
+	ThumbnailDir string  `json:"thumbnail_dir,omitempty"` // NEW: The thumbnail subfolder path
+	Data         string  `json:"data,omitempty"`
+}
+
+// --- PENTECOST BUFFER ---
+type BufferedPayload struct {
+	Subject   string
+	Payload   []byte
+	Timestamp time.Time
 }
 
 type PentecostBuffer struct {
 	mu       sync.Mutex
-	segments []*StreamSegment
+	queue    []BufferedPayload
 	duration time.Duration
+	js       nats.JetStreamContext
 }
 
-func NewPentecostBuffer(duration time.Duration) *PentecostBuffer {
+func NewPentecostBuffer(js nats.JetStreamContext, duration time.Duration) *PentecostBuffer {
 	return &PentecostBuffer{
+		queue:    make([]BufferedPayload, 0),
 		duration: duration,
-		segments: make([]*StreamSegment, 0, 5000),
+		js:       js,
 	}
 }
 
-func (pb *PentecostBuffer) Add(seg *StreamSegment) {
+func (pb *PentecostBuffer) Add(subject string, payload []byte) {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
-	pb.segments = append(pb.segments, seg)
-	// Safety cap to prevent memory leaks
-	if len(pb.segments) > 10000 {
-		pb.segments = pb.segments[1:]
-	}
+	pb.queue = append(pb.queue, BufferedPayload{
+		Subject:   subject,
+		Payload:   payload,
+		Timestamp: time.Now(),
+	})
 }
 
-func (pb *PentecostBuffer) PopReady() []*StreamSegment {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
+func (pb *PentecostBuffer) Start(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
 
-	now := time.Now()
-	var ready []*StreamSegment
-	cutoffIndex := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pb.mu.Lock()
+			now := time.Now()
+			var cutoff int
 
-	for i, seg := range pb.segments {
-		if now.Sub(seg.Timestamp) >= pb.duration {
-			ready = append(ready, seg)
-			cutoffIndex = i + 1
-		} else {
-			break
+			for i, item := range pb.queue {
+				if now.Sub(item.Timestamp) >= pb.duration {
+					pb.js.PublishAsync(item.Subject, item.Payload)
+					log.Printf("📡 BROADCAST LIVE: 60s Buffer Released | Subject: %s", item.Subject)
+					cutoff = i + 1
+				} else {
+					break
+				}
+			}
+
+			if cutoff > 0 {
+				pb.queue = pb.queue[cutoff:]
+			}
+			pb.mu.Unlock()
 		}
 	}
-
-	if cutoffIndex > 0 {
-		pb.segments = pb.segments[cutoffIndex:]
-	}
-	return ready
 }
 
-// --- SERVICE ---
+// --- INGESTION SERVICE ---
 type IngestionService struct {
-	nc          *nats.Conn
-	js          nats.JetStreamContext
-	inputURL    string
-	videoBuffer *PentecostBuffer
-	audioBuffer *PentecostBuffer
+	nc       *nats.Conn
+	js       nats.JetStreamContext
+	inputURL string
+	buffer   *PentecostBuffer
+
+	mu           sync.Mutex
+	audioSamples int64
+	videoSeq     int
 }
 
 func main() {
-	RunService()
-}
+	log.Println("🚀 Starting Pentecost Ingestion Service v2.2 (Multi-Output Chunker)")
 
-func RunService() {
-	log.Println("🚀 Starting Pentecost Ingestion Service v2.1 (Audio Fix)")
+	if err := os.MkdirAll(SharedChunkPath, 0755); err != nil {
+		log.Fatalf("❌ Failed to create shared chunk directory: %v", err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -112,31 +135,23 @@ func RunService() {
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		<-sigChan
-		log.Println("🛑 Shutdown signal received")
 		cancel()
 	}()
 
-	// 1. Connect to NATS
-	var nc *nats.Conn
-	var err error
-	for i := 0; i < 10; i++ {
-		url := os.Getenv("NATS_URL")
-		if url == "" {
-			url = NatsURL
-		}
-		nc, err = nats.Connect(url, nats.Name("Pentecost-Ingest"))
-		if err == nil {
-			break
-		}
-		log.Printf("⚠️ NATS unavailable, retrying (%d/10)...", i+1)
-		time.Sleep(2 * time.Second)
-	}
+	nc, err := nats.Connect(
+		os.Getenv("NATS_URL"),
+		nats.Name("Pentecost-Batch-Ingest"),
+		nats.MaxReconnects(-1),
+		nats.RetryOnFailedConnect(true),
+	)
 	if err != nil {
 		log.Fatal("❌ NATS Connection Failed:", err)
 	}
 	defer nc.Close()
 
-	js, err := nc.JetStream()
+	js, err := nc.JetStream(nats.PublishAsyncErrHandler(func(js nats.JetStream, msg *nats.Msg, err error) {
+		log.Printf("❌ CRITICAL: NATS Async Publish Failed [Subj: %s]: %v", msg.Subject, err)
+	}))
 	if err != nil {
 		log.Fatal("❌ JetStream Init Failed:", err)
 	}
@@ -144,94 +159,36 @@ func RunService() {
 	createStream(js, "LIVESTREAM_RAW", []string{VideoSubject, AudioSubject})
 
 	svc := &IngestionService{
-		nc:          nc,
-		js:          js,
-		inputURL:    os.Getenv("INPUT_URL"),
-		videoBuffer: NewPentecostBuffer(BufferDuration),
-		audioBuffer: NewPentecostBuffer(BufferDuration),
+		nc:       nc,
+		js:       js,
+		inputURL: os.Getenv("INPUT_URL"),
+		buffer:   NewPentecostBuffer(js, BufferDelay),
 	}
 
 	if svc.inputURL == "" {
-		svc.inputURL = "https://www.youtube.com/watch?v=jL8uDJJBjMA" // Al Jazeera default
+		svc.inputURL = "https://www.youtube.com/watch?v=jL8uDJJBjMA"
 	}
 
-	// 2. Start Broadcaster
-	go svc.startBroadcaster(ctx)
-
-	// 3. Start TCP Listeners for FFmpeg
 	var wg sync.WaitGroup
-	videoReady := make(chan struct{})
 	audioReady := make(chan struct{})
 
-	wg.Add(2)
-	go func() { defer wg.Done(); svc.startVideoServer(ctx, videoReady) }()
-	go func() { defer wg.Done(); svc.startAudioServer(ctx, audioReady) }()
-
-	log.Println("⏳ Waiting for TCP listeners...")
-	<-videoReady
-	<-audioReady
-	log.Println("✅ TCP Listeners Active")
-
-	// 4. Run FFmpeg Loop
 	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		svc.runFFmpegLoop(ctx)
-	}()
+	go func() { defer wg.Done(); svc.buffer.Start(ctx) }()
+
+	wg.Add(1)
+	go func() { defer wg.Done(); svc.diskJanitor(ctx) }()
+
+	wg.Add(1)
+	go func() { defer wg.Done(); svc.startAudioServer(ctx, audioReady) }()
+	<-audioReady
+
+	wg.Add(1)
+	go func() { defer wg.Done(); svc.videoStabilizationWatcher(ctx) }()
+
+	wg.Add(1)
+	go func() { defer wg.Done(); svc.runFFmpegLoop(ctx) }()
 
 	wg.Wait()
-}
-
-func (s *IngestionService) startBroadcaster(ctx context.Context) {
-	ticker := time.NewTicker(50 * time.Millisecond) // Fast tick for smooth playback
-	defer ticker.Stop()
-
-	log.Printf("⏳ Pentecost Buffer Active: Holding streams for %v...", BufferDuration)
-	hasBroadcast := false
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			// 1. Process Video
-			readyVideo := s.videoBuffer.PopReady()
-			for _, seg := range readyVideo {
-				msg := &nats.Msg{
-					Subject: VideoSubject,
-					Data:    seg.Data,
-					Header:  nats.Header{},
-				}
-				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
-				s.js.PublishMsgAsync(msg)
-			}
-
-			// 2. Process Audio
-			readyAudio := s.audioBuffer.PopReady()
-			for _, seg := range readyAudio {
-				msg := &nats.Msg{
-					Subject: AudioSubject,
-					Data:    seg.Data,
-					Header:  nats.Header{},
-				}
-				msg.Header.Add("pts", fmt.Sprintf("%d", seg.PTS))
-				s.js.PublishMsgAsync(msg)
-			}
-
-			// Flush Async Buffer
-			select {
-			case <-s.js.PublishAsyncComplete():
-			default:
-			}
-
-			if len(readyVideo) > 0 || len(readyAudio) > 0 {
-				if !hasBroadcast {
-					log.Println("📡 BROADCAST LIVE: First frames released from buffer!")
-					hasBroadcast = true
-				}
-			}
-		}
-	}
 }
 
 func (s *IngestionService) runFFmpegLoop(ctx context.Context) {
@@ -242,137 +199,82 @@ func (s *IngestionService) runFFmpegLoop(ctx context.Context) {
 		default:
 			streamURL := s.inputURL
 
-			// Resolve YouTube URL
 			if strings.Contains(s.inputURL, "youtube.com") || strings.Contains(s.inputURL, "youtu.be") {
 				log.Println("🔍 Resolving YouTube URL with yt-dlp...")
-				// Force HLS (m3u8) for better stability
-				cmd := exec.CommandContext(ctx, "yt-dlp", "-f", "95/94/93/best", "-g", s.inputURL)
+				cmd := exec.CommandContext(ctx, "yt-dlp",
+					// "-f", "95/94/93/b",
+					"-f", "best[ext=mp4]/best", // FIX: Used for facial recognition testing This grabs standard 1080p videos AND live streams
+					"-g",
+					"--no-warnings",
+					"--no-cache-dir",
+					"--extractor-args", "youtube:player_client=android",
+					s.inputURL,
+				)
+
+				var stderr bytes.Buffer
+				cmd.Stderr = &stderr
+
 				out, err := cmd.Output()
+
 				if err != nil {
-					log.Printf("❌ yt-dlp failed: %v. Retrying in 5s...", err)
+					log.Printf("❌ yt-dlp failed (Retrying in 5s):\nError: %v\nDetails: %s", err, stderr.String())
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				streamURL = strings.TrimSpace(string(out))
+
+				urls := strings.Split(strings.TrimSpace(string(out)), "\n")
+				streamURL = strings.TrimSpace(urls[0])
+
+				if streamURL == "" {
+					log.Printf("❌ yt-dlp returned an empty URL. Retrying in 5s...")
+					time.Sleep(5 * time.Second)
+					continue
+				}
 				log.Println("✅ Resolved Stream URL")
 			}
 
-			log.Println("🎬 Starting FFmpeg Ingestion...")
+			s.mu.Lock()
+			startSeq := s.videoSeq
+			s.mu.Unlock()
 
-			// CRITICAL FFMPEG ARGS FOR SYNC & AUDIO QUALITY
+			// Calculate the continuous image sequence start number
+			imageStartNum := (startSeq * 15) + 1
+
 			args := []string{
 				"-hide_banner", "-loglevel", "error",
-				"-re", // Read input at native frame rate
-				"-i", streamURL,
+				"-re", "-i", streamURL,
 
-				// VIDEO: Copy H.264 stream directly to TCP 4000
+				// OUTPUT A: Video MP4 Segments
 				"-map", "0:v",
-				"-c:v", "copy",
-				"-bsf:v", "h264_mp4toannexb", // Essential for raw H.264 stream
-				"-f", "h264",
-				"tcp://127.0.0.1:4000",
+				"-c:v", "libx264", "-preset", "veryfast",
+				"-force_key_frames", "expr:gte(t,n_forced*5)",
+				"-f", "segment", "-segment_time", "5",
+				"-segment_start_number", fmt.Sprintf("%d", startSeq),
+				"-segment_format", "mp4", "-reset_timestamps", "1",
+				fmt.Sprintf("%s/chunk_v_%%d.mp4", SharedChunkPath),
 
-				// AUDIO: Transcode to PCM Float32LE @ 16000Hz Mono
+				// OUTPUT B: Thumbnails (3 FPS JPEGs)
+				"-map", "0:v",
+				"-vf", "fps=3",
+				"-c:v", "mjpeg",
+				"-q:v", "2", // High quality JPEGs
+				"-f", "image2",
+				"-start_number", fmt.Sprintf("%d", imageStartNum), // Aligns with video sequence
+				fmt.Sprintf("%s/frame_%%08d.jpg", SharedChunkPath),
+
+				// OUTPUT C: Audio TCP Stream
 				"-map", "0:a",
-				"-c:a", "pcm_f32le",
-				"-ar", "16000", // FORCE 16k
-				"-ac", "1", // FORCE Mono
-				"-f", "f32le", // Raw float32 stream
-				"tcp://127.0.0.1:4001",
+				"-c:a", "pcm_f32le", "-ar", "16000", "-ac", "1",
+				"-f", "f32le", "tcp://127.0.0.1:4001",
 			}
 
 			cmd := exec.CommandContext(ctx, "ffmpeg", args...)
-			cmd.Stderr = os.Stderr // Pipe FFmpeg errors to Docker logs
+			cmd.Stderr = os.Stderr
+			cmd.Run()
 
-			if err := cmd.Run(); err != nil {
-				log.Printf("⚠️ FFmpeg exited: %v", err)
-			}
-
-			// If FFmpeg dies, wait before restarting
+			log.Println("⚠️ FFmpeg connection lost. Restarting in 2s...")
 			time.Sleep(2 * time.Second)
 		}
-	}
-}
-
-func (s *IngestionService) startVideoServer(ctx context.Context, ready chan<- struct{}) {
-	ln, err := net.Listen("tcp", VideoPort)
-	if err != nil {
-		log.Fatal(err)
-	}
-	close(ready)
-	defer ln.Close()
-
-	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go s.handleVideo(conn)
-	}
-}
-
-// Split H.264 stream into NAL units
-func (s *IngestionService) handleVideo(conn net.Conn) {
-	defer conn.Close()
-	log.Println("🔌 Video Stream Connected!")
-
-	// 10MB Buffer for HD frames
-	scanner := bufio.NewScanner(conn)
-	buf := make([]byte, 10*1024*1024)
-	scanner.Buffer(buf, 10*1024*1024)
-
-	// Custom Split function for H.264 NAL start codes (00 00 00 01)
-	scanner.Split(func(data []byte, atEOF bool) (advance int, token []byte, err error) {
-		if atEOF && len(data) == 0 {
-			return 0, nil, nil
-		}
-
-		// Find NAL start code
-		delimiter := []byte{0, 0, 0, 1}
-		if i := bytes.Index(data, delimiter); i >= 0 {
-			// Found start code
-			if i == 0 {
-				// We are at the start, find NEXT start code
-				if j := bytes.Index(data[4:], delimiter); j >= 0 {
-					return j + 4, data[:j+4], nil
-				}
-				// Need more data to find end of frame
-				if atEOF {
-					return len(data), data, nil
-				}
-				return 0, nil, nil
-			}
-			// We found a start code later in buffer, return up to it
-			return i, data[:i], nil
-		}
-
-		if atEOF {
-			return len(data), data, nil
-		}
-		return 0, nil, nil
-	})
-
-	start := time.Now()
-	for scanner.Scan() {
-		frame := make([]byte, len(scanner.Bytes()))
-		copy(frame, scanner.Bytes()) // Copy strictly
-
-		pts := time.Since(start).Milliseconds() * 90 // 90kHz clock for consistency
-
-		isKey := false
-		if len(frame) > 4 {
-			nalType := frame[4] & 0x1F
-			if nalType == 5 || nalType == 7 || nalType == 8 {
-				isKey = true
-			}
-		}
-
-		s.videoBuffer.Add(&StreamSegment{
-			Data:       frame,
-			Timestamp:  time.Now(),
-			PTS:        pts,
-			IsKeyframe: isKey,
-		})
 	}
 }
 
@@ -395,55 +297,141 @@ func (s *IngestionService) startAudioServer(ctx context.Context, ready chan<- st
 
 func (s *IngestionService) handleAudio(conn net.Conn) {
 	defer conn.Close()
-	log.Println("🔌 Audio Stream Connected!")
+	log.Println("🔌 Audio Stream Connected! (Batch Master Clock)")
 
-	// Chunk Size: 4096 bytes (1024 samples @ Float32)
-	// At 16000Hz, 1024 samples = 64ms duration
-	buf := make([]byte, AudioChunkSz)
-	var totalSamples int64 = 0
+	buf := make([]byte, AudioBatchSize)
 
 	for {
-		// ReadFull ensures we get a complete chunk.
-		// Previous code used Read() which returns partial chunks -> SPEEDUP BUG
-		n, err := io.ReadFull(conn, buf)
+		_, err := io.ReadFull(conn, buf)
 		if err != nil {
-			if err != io.EOF {
-				log.Printf("Audio read error: %v", err)
-			}
 			return
 		}
 
-		dataCopy := make([]byte, n)
-		copy(dataCopy, buf[:n])
+		s.mu.Lock()
+		pts := (s.audioSamples * 1000) / int64(SampleRate)
+		s.audioSamples += int64(AudioBatchSize / BytesPerSamp)
+		s.mu.Unlock()
 
-		// Calculate PTS based on sample count
-		// PTS = (TotalSamples / SampleRate) * 1000ms
-		// We use simple sample counting for exact sync
+		payload := ChunkPayload{
+			ChunkID:  fmt.Sprintf("a_%d", pts),
+			PTS:      pts,
+			Duration: float64(BatchDuration),
+			Data:     base64.StdEncoding.EncodeToString(buf),
+		}
 
-		pts := (totalSamples * 1000) / int64(SampleRate)
-		totalSamples += int64(n / BytesPerSamp)
+		payloadBytes, _ := json.Marshal(payload)
 
-		s.audioBuffer.Add(&StreamSegment{
-			Data:      dataCopy,
-			Timestamp: time.Now(),
-			PTS:       pts,
-		})
+		s.buffer.Add(AudioSubject, payloadBytes)
+		log.Printf("🎵 Audio Batch queued for 60s delay | PTS: %d", pts)
+	}
+}
+
+func (s *IngestionService) videoStabilizationWatcher(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+			s.mu.Lock()
+			currentSeq := s.videoSeq
+			s.mu.Unlock()
+
+			// Check if N+1 exists. If so, N is completely written.
+			triggerFilePath := fmt.Sprintf("%s/chunk_v_%d.mp4", SharedChunkPath, currentSeq+1)
+
+			if _, err := os.Stat(triggerFilePath); err == nil {
+				pts := int64(currentSeq * 5000)
+				currentFilePath := fmt.Sprintf("%s/chunk_v_%d.mp4", SharedChunkPath, currentSeq)
+
+				// CREATE THE THUMBNAIL SUBFOLDER
+				thumbDir := fmt.Sprintf("%s/thumbs_v_%d", SharedChunkPath, pts)
+				os.MkdirAll(thumbDir, 0755)
+
+				// MOVE EXACTLY 15 FRAMES INTO THE SUBFOLDER
+				startFrame := currentSeq*15 + 1
+				endFrame := startFrame + 14
+				for f := startFrame; f <= endFrame; f++ {
+					src := fmt.Sprintf("%s/frame_%08d.jpg", SharedChunkPath, f)
+					dst := fmt.Sprintf("%s/frame_%02d.jpg", thumbDir, f-startFrame+1)
+					os.Rename(src, dst) // Will safely ignore if a frame dropped
+				}
+
+				payload := ChunkPayload{
+					ChunkID:      fmt.Sprintf("v_%d", pts),
+					PTS:          pts,
+					Duration:     float64(BatchDuration),
+					FilePath:     currentFilePath,
+					ThumbnailDir: thumbDir, // ATTACH TO JSON PAYLOAD
+				}
+
+				payloadBytes, _ := json.Marshal(payload)
+
+				s.buffer.Add(VideoSubject, payloadBytes)
+				log.Printf("📦 Video Batch & Thumbs queued | PTS: %d | Path: %s", pts, thumbDir)
+
+				s.mu.Lock()
+				s.videoSeq++
+				s.mu.Unlock()
+			}
+		}
+	}
+}
+
+// diskJanitor cleans up MP4s, Subdirectories, and any orphaned image files
+func (s *IngestionService) diskJanitor(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+
+			// 1. Clean old MP4s
+			files, err := filepath.Glob(fmt.Sprintf("%s/chunk_v_*.mp4", SharedChunkPath))
+			if err == nil {
+				for _, file := range files {
+					info, err := os.Stat(file)
+					if err == nil && now.Sub(info.ModTime()) > 180*time.Second {
+						os.Remove(file)
+					}
+				}
+			}
+
+			// 2. Clean old Thumbnail Subdirectories
+			dirs, err := filepath.Glob(fmt.Sprintf("%s/thumbs_v_*", SharedChunkPath))
+			if err == nil {
+				for _, dir := range dirs {
+					info, err := os.Stat(dir)
+					if err == nil && info.IsDir() && now.Sub(info.ModTime()) > 180*time.Second {
+						os.RemoveAll(dir) // Recursively delete directory and images
+					}
+				}
+			}
+
+			// 3. Clean orphaned frames (in case a segment was incomplete)
+			orphans, err := filepath.Glob(fmt.Sprintf("%s/frame_*.jpg", SharedChunkPath))
+			if err == nil {
+				for _, orphan := range orphans {
+					info, err := os.Stat(orphan)
+					if err == nil && now.Sub(info.ModTime()) > 180*time.Second {
+						os.Remove(orphan)
+					}
+				}
+			}
+		}
 	}
 }
 
 func createStream(js nats.JetStreamContext, name string, subjects []string) {
 	_, err := js.StreamInfo(name)
 	if err != nil {
-		log.Printf("Creating Stream: %s", name)
-		_, err = js.AddStream(&nats.StreamConfig{
+		js.AddStream(&nats.StreamConfig{
 			Name:      name,
 			Subjects:  subjects,
-			MaxAge:    5 * time.Minute,
+			MaxAge:    10 * time.Minute,
 			Storage:   nats.MemoryStorage,
 			Retention: nats.LimitsPolicy,
 		})
-		if err != nil {
-			log.Printf("⚠️ Stream Create Warn: %v", err)
-		}
 	}
 }

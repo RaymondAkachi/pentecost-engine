@@ -21,3 +21,11 @@ __pycache__/
 
 #Model weights
 services/asr/adapter
+
+**.jpeg
+**.jpg
+**.png
+**.pdf
+**.onnx
+services/face_detection/data
+services/face_detection/models

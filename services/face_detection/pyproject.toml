@@ -1,0 +1,11 @@
+[project]
+name = "face-detection"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mediapipe>=0.10.32",
+    "numpy>=1.26.4",
+    "opencv-python>=4.11.0.86",
+]

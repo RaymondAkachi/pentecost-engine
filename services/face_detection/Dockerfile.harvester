@@ -1,0 +1,22 @@
+FROM python:3.10-slim
+
+# Install modern system dependencies
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# STABILITY FIX: Pin mediapipe to the last stable solutions version (0.10.14)
+RUN pip install --no-cache-dir opencv-python-headless mediapipe==0.10.14 numpy
+
+# Copy the script into the container
+COPY harvester.py .
+
+# Create a data directory inside the container
+RUN mkdir -p /app/data
+
+# The container will run the script and exit
+CMD ["python", "-u", "harvester.py"]

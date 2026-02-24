@@ -1,0 +1,56 @@
+version: '3.8'
+
+services:
+  # The Message Broker
+  nats:
+    image: nats:alpine
+    container_name: pentecost-nats
+    command: "-js -m 8222"
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # The Go Ingestion Engine (Outputs MP4 & 15 JPEGs to RAM Disk)
+  ingestion:
+    build:
+      context: ../ingestion
+      dockerfile: Dockerfile # Your existing Go Dockerfile
+    container_name: pentecost-ingestion
+    environment:
+      - NATS_URL=nats://nats:4222
+      # - INPUT_URL=https://www.youtube.com/watch?v=lfEpIPxAdjM&t=5093s # Standard Video Link
+      - INPUT_URL=https://www.youtube.com/watch?v=ufXSfsNMaNM # Test Mr Beast video (1080p)
+      # - INPUT_URL=https://www.youtube.com/watch?v=Ekn58CZ_YU0 #Today's life church live stream (Used for testing, not permanent)
+    depends_on:
+      - nats
+    volumes:
+      - shared_chunks:/shared/chunks
+
+  # The Python Face Engine (Reads JPEGs from RAM Disk over NATS event)
+  face-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile.face
+    container_name: pentecost-face-engine
+    environment:
+      - NATS_URL=nats://nats:4222
+    depends_on:
+      - nats
+      - ingestion
+    volumes:
+      - shared_chunks:/shared/chunks
+      - ./data/reference_gallery:/app/reference_gallery
+      - ./models:/app/models
+
+volumes:
+  shared_chunks:
+    driver: local
+    driver_opts:
+      type: tmpfs
+      device: tmpfs
+      o: size=1G,uid=1000

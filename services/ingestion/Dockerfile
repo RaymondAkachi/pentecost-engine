@@ -53,5 +53,8 @@ COPY --from=builder /app/ingestion-service .
 # 4. Expose internal ports (used by FFmpeg loopback)
 EXPOSE 4000 4001
 
+# Shared volume for chunks
+RUN mkdir -p /shared/chunks
+
 # 5. Production Entrypoint
 CMD ["./ingestion-service"]
