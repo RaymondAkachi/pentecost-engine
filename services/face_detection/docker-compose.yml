@@ -24,7 +24,7 @@ services:
     environment:
       - NATS_URL=nats://nats:4222
       # - INPUT_URL=https://www.youtube.com/watch?v=lfEpIPxAdjM&t=5093s # Standard Video Link
-      - INPUT_URL=https://www.youtube.com/watch?v=ufXSfsNMaNM # Test Mr Beast video (1080p)
+      - INPUT_URL=https://www.youtube.com/watch?v=3nAbr13AL5k&t=5s # Test Mr Beast video (1080p)
       # - INPUT_URL=https://www.youtube.com/watch?v=Ekn58CZ_YU0 #Today's life church live stream (Used for testing, not permanent)
     depends_on:
       - nats
@@ -44,8 +44,9 @@ services:
       - ingestion
     volumes:
       - shared_chunks:/shared/chunks
-      - ./data/reference_gallery:/app/reference_gallery
-      - ./models:/app/models
+      - ./live_debug_faces:/shared/debug_faces
+      # 🚀 THE DEVOPS LIFELINE: Maps your script directly into RAM. No builds required.
+      - ./worker_face.py:/app/worker_face.py
 
 volumes:
   shared_chunks:

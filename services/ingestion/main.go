@@ -345,7 +345,11 @@ func (s *IngestionService) videoStabilizationWatcher(ctx context.Context) {
 
 				// CREATE THE THUMBNAIL SUBFOLDER
 				thumbDir := fmt.Sprintf("%s/thumbs_v_%d", SharedChunkPath, pts)
-				os.MkdirAll(thumbDir, 0755)
+				err := os.RemoveAll(thumbDir)
+				if err != nil {
+					log.Printf("Warning: Failed to clear old thumbnails: %v", err)
+				}
+				err = os.MkdirAll(thumbDir, 0755)
 
 				// MOVE EXACTLY 15 FRAMES INTO THE SUBFOLDER
 				startFrame := currentSeq*15 + 1

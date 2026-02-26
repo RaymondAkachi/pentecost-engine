@@ -23,7 +23,7 @@ services:
     build: ./services/ingestion
     environment:
       - NATS_URL=nats://nats:4222
-      - INPUT_URL=https://www.youtube.com/watch?v=ijcfMijOgao # Not permanent live church broadcast, just for testing
+      - INPUT_URL=https://www.youtube.com/watch?v=1tA-T4PVoyQ # Not permanent live church broadcast, just for testing
     depends_on: [init-infra]
 
   # --- LAYER 1: ASR ---
