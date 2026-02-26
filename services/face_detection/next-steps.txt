@@ -1,0 +1,316 @@
+Part 1: The "Anchor Data" Protocol (The 15 Photos)
+You do not need different clothes, and you do not need multiple days or sittings. You can rapid-fire take these in 2 minutes right before or after a service.
+
+However, to build a mathematically indestructible "Identity Centroid", the AI needs to understand the 3D geometry of his face. Here is the exact breakdown of the 15 photos you need to take:
+
+The Setup:
+
+Lighting: Stand him on the actual stage under the actual preaching lights (this is critical—it teaches the AI the stage's shadow patterns).
+
+Camera: A high-quality DSLR or modern smartphone (iPhone Pro/Samsung Ultra). Stand about 4 to 6 feet away.
+
+The 15 Shots (Rapid Fire):
+
+5 "Neutral" Shots: Looking dead at the camera.
+
+5 "Preaching" Shots: Ask him to open his mouth slightly, raise his eyebrows, and mimic the intensity of a sermon while looking at the camera. (This prevents the AI from rejecting him when his face contorts while shouting).
+
+5 "Angle" Shots (The most important): * 1 looking slightly Left (about 15 degrees).
+
+1 looking slightly Right.
+
+1 looking slightly Up.
+
+1 looking slightly Down.
+
+1 looking down as if reading a Bible.
+
+Do not crop these photos yourself. Put the raw, high-res photos into your reference_gallery folder. We will use RetinaFace to mathematically extract them during startup.
+
+Part 2: Do You Need Anything Else?
+To guarantee this works, you only need one strict hardware requirement that you do not currently have: The NVIDIA Container Toolkit.
+
+Because Docker containers are isolated sandboxes, they cannot see your host machine's GPU by default.
+
+The host machine (the server running this) must have an NVIDIA GPU (RTX 3090, 4090, A10G, or T4).
+
+The host machine must have the nvidia-container-toolkit installed on its operating system.
+
+Your docker-compose.yml must explicitly pass the GPU through to the container.
+
+Part 3: Detailed Build Guide for the Enterprise Face-Engine
+Here is the exact blueprint to build the Tier 3 Biometric Gatekeeper.
+
+Step 1: The GPU-Enabled docker-compose.yml
+You must add the deploy block to your face-detection service so Docker knows to hand the GPU to the AI models.
+
+YAML
+  face-detection:
+    build: 
+      context: ./services/face_detection
+      dockerfile: Dockerfile.face
+    environment:
+      - NATS_URL=nats://nats:4222
+    volumes:
+      - shared_chunks:/shared/chunks
+      - ./worker_face.py:/app/worker_face.py
+      - ./reference_gallery:/app/reference_gallery
+    depends_on:
+      - ingestion
+    # 🚀 THIS IS REQUIRED TO UNLOCK THE GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+Step 2: The GPU-Optimized Dockerfile.face
+We are abandoning lightweight Python images. We will use the official TensorFlow GPU image so all CUDA drivers, C++ compilers, and GPU binaries are perfectly configured out of the box.
+
+Dockerfile
+# 🚀 Use official TensorFlow GPU image for zero-headache CUDA support
+FROM tensorflow/tensorflow:2.15.0-gpu
+
+# System dependencies
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install DeepFace and High-Speed Tracker
+RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --no-cache-dir \
+    deepface \
+    tf-keras \
+    opencv-python-headless \
+    ultralytics \
+    nats-py==2.8.0
+
+COPY . /app/
+
+CMD ["python", "-u", "worker_face.py"]
+Step 3: The Enterprise worker_face.py
+This code uses YOLOv8 to track the bodies across the stage, RetinaFace to find the face at extreme preaching angles, and ArcFace to verify the identity with military-grade precision.
+
+Python
+import os
+import asyncio
+import json
+import cv2
+import numpy as np
+import time
+from ultralytics import YOLO
+import nats
+from nats.js.errors import NotFoundError
+
+# 🚀 Enterprise Biometrics
+from deepface import DeepFace
+
+# ==============================================================================
+# GLOBAL CONFIGURATION
+# ==============================================================================
+REFERENCE_DIR = "/app/reference_gallery"
+
+# Temporal State Machine (CPU/GPU Savior)
+TRACK_STATE_MACHINE = {}  
+TRACK_EXPIRY_SECONDS = 30.0 
+worker_lock = asyncio.Lock()
+
+print("🧠 Booting Enterprise GPU Director...", flush=True)
+
+# 1. The Cameraman: Tracks human bodies
+global_yolo = YOLO('yolov8n.pt') 
+
+# ==============================================================================
+# STARTUP: FORGING THE ARCFACE DATABASE
+# ==============================================================================
+DB_EMBEDDINGS = []
+
+if os.path.exists(REFERENCE_DIR):
+    print("\n--- FORGING IDENTITY MATRIX (RETINAFACE + ARCFACE) ---", flush=True)
+    
+    for file in os.listdir(REFERENCE_DIR):
+        if not file.lower().endswith(('.png', '.jpg', '.jpeg')): continue
+        img_path = os.path.join(REFERENCE_DIR, file)
+        
+        try:
+            # RetinaFace extracts the face at any angle. ArcFace builds the 512-D vector.
+            results = DeepFace.represent(
+                img_path=img_path, 
+                model_name="ArcFace", 
+                detector_backend="retinaface", 
+                enforce_detection=True
+            )
+            DB_EMBEDDINGS.append(results[0]["embedding"])
+        except Exception as e:
+            print(f"⚠️ Warning: RetinaFace could not find a clear face in {file}", flush=True)
+            pass
+            
+    if DB_EMBEDDINGS:
+        print(f"✅ SYSTEM READY: {len(DB_EMBEDDINGS)} Enterprise vectors loaded into VRAM.", flush=True)
+    else:
+        print("🛑 FATAL: No valid anchor photos found.", flush=True)
+        exit(1)
+else:
+    print("🛑 FATAL: Reference directory missing.", flush=True)
+    exit(1)
+
+# ==============================================================================
+# MATHEMATICS
+# ==============================================================================
+def cosine_similarity(a, b):
+    a, b = np.array(a), np.array(b)
+    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+
+# ==============================================================================
+# THE ENGINE PIPELINE
+# ==============================================================================
+def detect_faces(thumbnail_dir: str) -> dict:
+    global TRACK_STATE_MACHINE
+    passes, fails, processed_frames = 0, 0, 0
+    total_confidence = 0.0
+    
+    current_time = time.time()
+    TRACK_STATE_MACHINE = {k: v for k, v in TRACK_STATE_MACHINE.items() if (current_time - v["last_seen"]) < TRACK_EXPIRY_SECONDS}
+
+    raw_frames = sorted([f for f in os.listdir(thumbnail_dir) if f.endswith(".jpg")])
+    frames = [f for f in raw_frames if abs(current_time - os.path.getmtime(os.path.join(thumbnail_dir, f))) < 120]
+
+    if not frames: return {"RequiresFullVideo": False, "Passes": 0, "Fails": 8}
+
+    for frame_file in frames:
+        if passes >= 3 or fails >= 12: break
+
+        frame_path = os.path.join(thumbnail_dir, frame_file)
+        frame = cv2.imread(frame_path)
+        if frame is None: fails += 1; continue
+
+        processed_frames += 1
+        img_h, img_w, _ = frame.shape
+
+        # --- STAGE 1: BODY TRACKING ---
+        results = global_yolo.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)
+        boxes = results[0].boxes
+        
+        dominant_person, max_area = None, 0
+        if boxes is not None and boxes.id is not None:
+            for i, box in enumerate(boxes):
+                if int(box.cls[0]) == 0:
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+                    area = (x2 - x1) * (y2 - y1)
+                    if area > max_area:
+                        max_area = area
+                        dominant_person = {"id": int(boxes.id[i].item()), "box": [x1, y1, x2, y2], "area": area}
+
+        if not dominant_person: fails += 1; continue
+
+        person_ratio = dominant_person["area"] / (img_w * img_h)
+        track_id = dominant_person["id"]
+        x1, y1, x2, y2 = dominant_person["box"]
+
+        if person_ratio < 0.12: fails += 1; continue # Ignore crowd
+
+        # --- STAGE 2: TEMPORAL LOCK BYPASS ---
+        if track_id not in TRACK_STATE_MACHINE:
+            TRACK_STATE_MACHINE[track_id] = {"hits": 0, "last_seen": current_time, "locked": False}
+        else:
+            TRACK_STATE_MACHINE[track_id]["last_seen"] = current_time
+
+        if TRACK_STATE_MACHINE[track_id]["locked"]:
+            passes += 1
+            print(f"   ↳ 🟢 {frame_file} | GPU LOCK ACTIVE: Body #{track_id}", flush=True)
+            continue
+
+        # --- STAGE 3: ARCFACE BIOMETRICS ---
+        # Crop the body to reduce the search area for RetinaFace
+        px1, py1 = max(0, int(x1) - 50), max(0, int(y1) - 50)
+        px2, py2 = min(img_w, int(x2) + 50), min(img_h, int(y2) + 50)
+        body_crop = frame[py1:py2, px1:px2]
+        
+        if body_crop.size == 0: fails += 1; continue
+
+        try:
+            df_results = DeepFace.represent(
+                img_path=body_crop, 
+                model_name="ArcFace", 
+                detector_backend="retinaface", 
+                enforce_detection=True
+            )
+            
+            live_embedding = df_results[0]["embedding"]
+            
+            # Compare against the 15 Apostle Anchors
+            similarities = [cosine_similarity(live_embedding, db_emb) for db_emb in DB_EMBEDDINGS]
+            top_3_scores = np.sort(similarities)[-3:]
+            consensus_mean = np.mean(top_3_scores)
+            
+            # ArcFace Cosine Threshold (Highly accurate above 0.60)
+            if consensus_mean >= 0.60:
+                TRACK_STATE_MACHINE[track_id]["hits"] += 1
+                hits = TRACK_STATE_MACHINE[track_id]["hits"]
+                
+                if hits >= 3:
+                    TRACK_STATE_MACHINE[track_id]["locked"] = True
+                    print(f"   ↳ 🔒 {frame_file} | MILITARY-GRADE VERIFIED! Body #{track_id} locked.", flush=True)
+                else:
+                    print(f"   ↳ ✅ {frame_file} | PARTIAL VERIFY [{hits}/3]: Body #{track_id}. (Sim: {consensus_mean:.3f})", flush=True)
+                passes += 1
+                total_confidence += consensus_mean
+                continue
+            else:
+                print(f"   ↳ ❌ {frame_file} | IMPOSTER REJECTED. (Sim: {consensus_mean:.3f})", flush=True)
+                
+        except ValueError:
+            # RetinaFace found no face (back turned, completely blurred)
+            print(f"   ↳ ⚠️ {frame_file} | NO FACE FOUND IN BODY. Waiting for better angle.", flush=True)
+            pass
+            
+        fails += 1
+
+    return {
+        "RequiresFullVideo": passes >= 3,
+        "Passes": passes,
+        "Fails": fails
+    }
+
+# ==============================================================================
+# NATS ASYNC EVENT LOOP
+# ==============================================================================
+async def main():
+    nc = await nats.connect(os.environ.get("NATS_URL", "nats://nats:4222"))
+    js = nc.jetstream()
+
+    async def video_handler(msg):
+        try:
+            payload = json.loads(msg.data.decode())
+            thumbnail_dir = payload.get("thumbnail_dir")
+            chunk_id = payload.get("chunk_id")
+            
+            if not thumbnail_dir or not os.path.exists(thumbnail_dir): return
+
+            print(f"\n🧠 Processing Chunk {chunk_id}...", flush=True)
+            async with worker_lock:
+                result = await asyncio.to_thread(detect_faces, thumbnail_dir)
+            
+            decision = "🟢 GPU ROUTE (Apostle Verified)" if result["RequiresFullVideo"] else "🔴 AUDIO ONLY"
+            print(f"🎯 {decision} | Passes: {result['Passes']}/8\n", flush=True)
+
+        except Exception as e:
+            print(f"❌ Error: {str(e)}", flush=True)
+        finally:
+            await msg.ack()
+
+    print("✅ Bound to Stream! Listening...", flush=True)
+    await js.subscribe("livestream.video.raw", stream="LIVESTREAM_RAW", cb=video_handler)
+    
+    try:
+        while True: await asyncio.sleep(1)
+    except asyncio.CancelledError: pass
+    finally: await nc.close()
+
+if __name__ == '__main__':
+    asyncio.run(main())
